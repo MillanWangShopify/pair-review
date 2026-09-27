@@ -19,8 +19,9 @@ const { GitWorktreeManager } = require('../git/worktree');
 const { GitHubClient } = require('../github/client');
 const { PRArgumentParser } = require('../github/parser');
 const { getGeneratedFilePatterns } = require('../git/gitattributes');
+const { buildChangedFileEntries } = require('../git/changed-file-entries');
 const { getShaAbbrevLength, DEFAULT_SHA_ABBREV_LENGTH } = require('../git/sha-abbrev');
-const { normalizeRepository, resolveRenamedFile, resolveRenamedFileOld } = require('../utils/paths');
+const { normalizeRepository } = require('../utils/paths');
 const { mergeInstructions } = require('../utils/instructions');
 const Analyzer = require('../ai/analyzer');
 const { v4: uuidv4 } = require('uuid');
@@ -56,7 +57,9 @@ const { safeParseJson } = require('../utils/safe-parse-json');
 const { mergeChangedFilesWithDiff, parseUnifiedDiffPatches } = require('../utils/diff-file-list');
 const { parseHunks } = require('../utils/diff-hunks');
 const { hashHunk } = require('../ai/hunk-hashing');
-const { resolveOriginalFileContentSpecs } = require('../utils/diff-file-content');
+const { resolveOriginalFileContentSpecs, findFileBlobInfoInDiff } = require('../utils/diff-file-content');
+const { resolveRepoRoot } = require('../utils/review-paths');
+const { createChangedFilePredicate } = require('../utils/changed-file-membership');
 const { validateCouncilConfig, normalizeCouncilConfig } = require('./councils');
 const { resolveReviewConfig } = require('../review-config');
 const { TIERS, TIER_ALIASES, VALID_TIERS, resolveTier } = require('../ai/prompts/config');
@@ -113,6 +116,15 @@ function attachHunkHashes(changedFiles, canonicalDiff) {
     if (!fileHashes) return file;
     return { ...file, hunk_hashes: fileHashes };
   });
+}
+
+/**
+ * Path of a `changed_files` entry (string, git entry, or GitHub API entry).
+ * @param {object|string} entry
+ * @returns {string|undefined}
+ */
+function changedFilePath(entry) {
+  return typeof entry === 'string' ? entry : (entry?.filename || entry?.file || entry?.path);
 }
 
 module.exports._computeHunkHashesFromDiff = computeHunkHashesFromDiff;
@@ -506,7 +518,7 @@ router.get('/api/pr/:owner/:repo/:number', async (req, res) => {
       const reviewContext = {
         prTitle: prMetadata.title,
         prDescription: prMetadata.description,
-        changedFiles: changedFiles.map((f) => (typeof f === 'string' ? f : (f.filename || f.file || f.path))).filter(Boolean)
+        changedFiles: changedFiles.map(changedFilePath).filter(Boolean)
       };
       const results = await Promise.allSettled([
         summaryGenerator.kickOffSummaryJob({
@@ -620,6 +632,8 @@ router.post('/api/pr/:owner/:repo/:number/refresh', async (req, res) => {
     };
     const diff = await worktreeManager.generateUnifiedDiff(worktreePath, diffPrData);
     const changedFiles = await worktreeManager.getChangedFiles(worktreePath, diffPrData);
+    // Spelled like the diff headers, as every reader of the cached copy sees it.
+    const mergedChangedFiles = mergeChangedFilesWithDiff(changedFiles, diff);
 
     // Prepare extended data
     const extendedData = {
@@ -723,7 +737,7 @@ router.post('/api/pr/:owner/:repo/:number/refresh', async (req, res) => {
         stack_data: stackData,
         created_at: prMetadata.created_at,
         updated_at: prMetadata.updated_at,
-        file_changes: parsedData.changed_files ? parsedData.changed_files.length : 0,
+        file_changes: mergedChangedFiles.length,
         additions: parsedData.additions || 0,
         deletions: parsedData.deletions || 0,
         diff_content: parsedData.diff || '',
@@ -749,7 +763,7 @@ router.post('/api/pr/:owner/:repo/:number/refresh', async (req, res) => {
       const reviewContext = {
         prTitle: prMetadata.title,
         prDescription: prMetadata.description,
-        changedFiles: (changedFiles || []).map((f) => (typeof f === 'string' ? f : (f.filename || f.file || f.path))).filter(Boolean)
+        changedFiles: mergedChangedFiles.map(changedFilePath).filter(Boolean)
       };
       const results = await Promise.allSettled([
         summaryGenerator.kickOffSummaryJob({
@@ -871,8 +885,8 @@ router.post('/api/pr/:owner/:repo/:number/jobs/:jobKey/start', async (req, res) 
     const reviewContext = {
       prTitle: prMetadata.title,
       prDescription: prMetadata.description,
-      changedFiles: (extendedData.changed_files || [])
-        .map((f) => (typeof f === 'string' ? f : (f.filename || f.file || f.path)))
+      changedFiles: mergeChangedFilesWithDiff(extendedData.changed_files || [], diffText)
+        .map(changedFilePath)
         .filter(Boolean)
     };
 
@@ -1186,22 +1200,7 @@ router.get('/api/pr/:owner/:repo/:number/diff', async (req, res) => {
           const summaryArgs = [`${baseSha}...${headSha}`, ...GIT_DIFF_SUMMARY_FLAGS_ARRAY, '-w'];
           const diffSummary = await git.diffSummary(summaryArgs);
           gitattributes = await getGeneratedFilePatterns(worktreePath);
-          changedFiles = diffSummary.files.map(file => {
-            const resolvedFile = resolveRenamedFile(file.file);
-            const isRenamed = resolvedFile !== file.file;
-            const result = {
-              file: resolvedFile,
-              insertions: file.insertions,
-              deletions: file.deletions,
-              changes: file.changes,
-              generated: gitattributes.isGenerated(resolvedFile)
-            };
-            if (isRenamed) {
-              result.renamed = true;
-              result.renamedFrom = resolveRenamedFileOld(file.file);
-            }
-            return result;
-          });
+          changedFiles = buildChangedFileEntries(diffSummary.files, gitattributes);
         }
       } catch (wsError) {
         logger.warn(`Could not generate diff for PR #${prNumber}: ${wsError.message}`);
@@ -1383,11 +1382,10 @@ router.get('/api/file-content-original/:fileName(*)', async (req, res) => {
       });
     }
 
-    const worktreeManager = new GitWorktreeManager(db);
-    const worktreePath = await worktreeManager.getWorktreePath({ owner, repo, number: prNumber });
-
-    // Check if worktree exists
-    if (!await worktreeManager.worktreeExists({ owner, repo, number: prNumber })) {
+    const worktreePath = await resolveRepoRoot(db, {
+      review_type: 'pr', repository: normalizeRepository(owner, repo), pr_number: prNumber
+    });
+    if (!worktreePath) {
       return res.status(404).json({
         error: 'Worktree not found for this PR. The PR may need to be reloaded.'
       });
@@ -1406,7 +1404,10 @@ router.get('/api/file-content-original/:fileName(*)', async (req, res) => {
       logger.warn('Could not parse pr_data for file-content route');
     }
 
-    const contentSpecs = resolveOriginalFileContentSpecs(prData, fileName);
+    // Unchanged-file findings use HEAD coordinates, the same checkout the AI
+    // read. base_sha may have advanced since the PR forked.
+    const contentSpecs = findFileBlobInfoInDiff(prData?.diff, fileName)
+      ? resolveOriginalFileContentSpecs(prData, fileName) : [];
 
     if (contentSpecs.length > 0) {
       try {
@@ -1571,9 +1572,37 @@ router.post('/api/pr/:owner/:repo/:number/submit-review', async (req, res) => {
     //
     // We check whether the comment's target line actually appears in a diff hunk
     // rather than relying on diff_position (which may not be set by all sources).
-    const diffLineSet = buildDiffLineSet(diffContent);
+    const diffSource = diffContent || prData.diff;
+    const diffLineSet = buildDiffLineSet(diffSource);
+    const resolveChangedFile = createChangedFilePredicate(prData.changed_files, diffSource);
+    if (comments.length > 0 && !resolveChangedFile.hasChangedFiles) {
+      return res.status(400).json({ error: "Could not determine the PR's changed files; reload the PR and try again" });
+    }
+    const skippedComments = [];
+    const submittableComments = comments.flatMap(comment => {
+      const file = resolveChangedFile(comment.file);
+      if (file) return [{ ...comment, file }];
+      skippedComments.push({
+        id: comment.id, file: comment.file, line_start: comment.line_start,
+        line_end: comment.line_end, body: comment.body,
+        is_file_level: comment.is_file_level, reason: 'outside_diff'
+      });
+      return [];
+    });
 
-    const graphqlComments = comments.map(comment => {
+    // GitHub rejects only COMMENT and REQUEST_CHANGES reviews that carry
+    // neither a body nor comments. A bodyless APPROVE, and a pending DRAFT,
+    // are valid and must reach GitHub even when every comment was skipped.
+    if (submittableComments.length === 0 && !String(body || '').trim() &&
+        (event === 'COMMENT' || event === 'REQUEST_CHANGES')) {
+      return res.status(400).json({
+        error: 'No review body or comments can be submitted to GitHub.',
+        skippedComments
+      });
+    }
+
+    const graphqlComments = submittableComments.map(comment => {
+      const file = comment.file;
       const side = comment.side || 'RIGHT';
       const isRange = comment.line_end && comment.line_end !== comment.line_start;
 
@@ -1583,7 +1612,7 @@ router.post('/api/pr/:owner/:repo/:number/submit-review', async (req, res) => {
         console.log(`Formatting file-level comment: ${comment.file}`);
 
         return {
-          path: comment.file,
+          path: file,
           body: comment.body,
           isFileLevel: true
         };
@@ -1596,8 +1625,8 @@ router.post('/api/pr/:owner/:repo/:number/submit-review', async (req, res) => {
       // line falls outside a hunk but the end is inside, submitting with start_line
       // would produce a position GitHub cannot render.
       const isExpandedContext = isRange
-        ? !diffLineSet.isLineInDiff(comment.file, comment.line_start, side) || !diffLineSet.isLineInDiff(comment.file, comment.line_end, side)
-        : !diffLineSet.isLineInDiff(comment.file, comment.line_start, side);
+        ? !diffLineSet.isLineInDiff(file, comment.line_start, side) || !diffLineSet.isLineInDiff(file, comment.line_end, side)
+        : !diffLineSet.isLineInDiff(file, comment.line_start, side);
 
       if (isExpandedContext) {
         // File-level comment with line reference prefix
@@ -1608,7 +1637,7 @@ router.post('/api/pr/:owner/:repo/:number/submit-review', async (req, res) => {
         console.log(`Formatting file-level comment (expanded context): ${comment.file} ${lineRef}`);
 
         return {
-          path: comment.file,
+          path: file,
           body: `${lineRef} ${comment.body}`,
           isFileLevel: true
         };
@@ -1617,7 +1646,7 @@ router.post('/api/pr/:owner/:repo/:number/submit-review', async (req, res) => {
       console.log(`Formatting line comment: ${comment.file}:${comment.line_start}${isRange ? `-${comment.line_end}` : ''} side=${side}`);
 
       const commentObj = {
-        path: comment.file,
+        path: file,
         line: isRange ? comment.line_end : comment.line_start,
         body: comment.body,
         side: side,
@@ -1632,7 +1661,7 @@ router.post('/api/pr/:owner/:repo/:number/submit-review', async (req, res) => {
     });
 
     // Submit review using GraphQL API (supports file-level comments)
-    console.log(`${event === 'DRAFT' ? 'Creating draft review' : 'Submitting review'} for PR #${prNumber} with ${comments.length} comments`);
+    console.log(`${event === 'DRAFT' ? 'Creating draft review' : 'Submitting review'} for PR #${prNumber} with ${submittableComments.length} comments`);
 
     let githubReview;
 
@@ -1769,7 +1798,7 @@ router.post('/api/pr/:owner/:repo/:number/submit-review', async (req, res) => {
       // Update comments table to mark submitted comments
       const commentStatus = event === 'DRAFT' ? 'draft' : 'submitted';
       const commentUpdateTime = new Date().toISOString();
-      for (const comment of comments) {
+      for (const comment of submittableComments) {
         await run(db, `
           UPDATE comments
           SET status = ?, updated_at = ?
@@ -1798,6 +1827,7 @@ router.post('/api/pr/:owner/:repo/:number/submit-review', async (req, res) => {
         message: `${event === 'DRAFT' ? 'Draft review created' : 'Review submitted'} successfully ${event === 'DRAFT' ? 'on' : 'to'} ${hostName}`,
         github_url: githubReview.html_url,
         comments_submitted: githubReview.comments_count,
+        skipped_comments: skippedComments,
         event: event,
         status: event === 'DRAFT' ? githubReview.state : undefined // Include status for drafts
       });
@@ -2745,11 +2775,13 @@ router.get('/api/pr/:owner/:repo/:number/share', async (req, res) => {
 
     // Build changed files list
     // changed_files may use 'insertions' (from git diff) or 'additions' (from GitHub API)
-    const changedFiles = (prData.changed_files || []).map(f => ({
-      path: f.file,
-      additions: f.insertions ?? f.additions ?? 0,
-      deletions: f.deletions ?? 0
-    }));
+    const changedFiles = mergeChangedFilesWithDiff(prData.changed_files || [], prData.diff || '')
+      .filter(f => changedFilePath(f))
+      .map(f => ({
+        path: changedFilePath(f),
+        additions: f.insertions ?? f.additions ?? 0,
+        deletions: f.deletions ?? 0
+      }));
 
     // Get the authenticated user (who is sharing).
     // Use the repo's binding so authentication targets the right host —

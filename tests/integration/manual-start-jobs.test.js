@@ -212,6 +212,40 @@ describe('Manual start endpoints', () => {
       expect(call.worktreePath).toBe('/tmp/worktree/pr-1');
     });
 
+    it('passes changed files spelled like the diff for PRs cached before paths were decoded', async () => {
+      const app = buildApp(db, { summaries: { enabled: true, auto_generate: false } });
+      const server = await startServer(app);
+      const diff = [
+        String.raw`diff --git "a/caf\303\251.js" "b/caf\303\251.js"`,
+        String.raw`--- "a/caf\303\251.js"`,
+        String.raw`+++ "b/caf\303\251.js"`,
+        '@@ -1 +1 @@',
+        '-old',
+        '+new',
+        'diff --git a/a => b.md b/a => b.md',
+        '--- a/a => b.md',
+        '+++ b/a => b.md',
+        '@@ -1 +1 @@',
+        '-old',
+        '+new',
+        ''
+      ].join('\n');
+      await run(db, `INSERT INTO pr_metadata (pr_number, repository, title, description, author, base_branch, head_branch, pr_data)
+        VALUES (1, 'owner/repo', 'My PR', '', 'alice', 'main', 'feature', ?)`, [JSON.stringify({
+        diff, worktree_path: '/tmp/worktree/pr-1',
+        changed_files: [
+          { file: String.raw`"caf\303\251.js"`, insertions: 1, deletions: 1 },
+          // A file literally named `a => b.md`, as numstat misreads it.
+          { file: 'b.md', insertions: 1, deletions: 1, renamed: true, renamedFrom: 'a' }
+        ]
+      })]);
+
+      const res = await request(server).post('/api/pr/owner/repo/1/jobs/summary/start');
+
+      expect(res.status).toBe(200);
+      expect(summarySpy.mock.calls[0][0].reviewContext.changedFiles).toEqual(['café.js', 'a => b.md']);
+    });
+
     it('starts a tour job with trigger: manual when enabled', async () => {
       const app = buildApp(db, { tours: { enabled: true, auto_generate: false } });
       const server = await startServer(app);

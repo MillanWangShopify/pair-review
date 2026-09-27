@@ -28,11 +28,13 @@ const { includesBranch, parseScopeArg, VALID_SCOPE_RANGES, EMPTY_SCOPE_MESSAGE }
 const { storePRData, resolvePrHostBinding, registerRepositoryLocation, findRepositoryPath } = require('./setup/pr-setup');
 const { resolvePreflightBinding, setupHostParam, bindingRepositoryForHost } = require('./utils/host-resolution');
 const { fireReviewStartedHook } = require('./hooks/payloads');
-const { normalizeRepository, resolveRenamedFile, resolveRenamedFileOld } = require('./utils/paths');
+const { normalizeRepository } = require('./utils/paths');
+const { normalizeSuggestionPath, createChangedFilePredicate } = require('./utils/changed-file-membership');
 const { rejectUrlLikeLocalReviewPath } = require('./utils/local-path-input');
 const logger = require('./utils/logger');
 const simpleGit = require('simple-git');
 const { getGeneratedFilePatterns } = require('./git/gitattributes');
+const { buildChangedFileEntries } = require('./git/changed-file-entries');
 const { GIT_DIFF_FLAGS_ARRAY, GIT_DIFF_SUMMARY_FLAGS_ARRAY } = require('./git/diff-flags');
 const { getEmoji: getCategoryEmoji } = require('./utils/category-emoji');
 const open = (...args) => process.env.PAIR_REVIEW_NO_OPEN ? Promise.resolve() : import('open').then(({default: open}) => open(...args));
@@ -1343,6 +1345,32 @@ function formatAISuggestion(text, category) {
   return `${emoji} **${capitalizedCategory}**: ${text}`;
 }
 
+/** Build headless GitHub comments, retaining only findings in changed files. */
+function prepareHeadlessReviewComments(aiSuggestions, changedFiles, diff = '') {
+  const resolveChangedFile = createChangedFilePredicate(changedFiles, diff);
+  const validSuggestions = (aiSuggestions || []).flatMap(suggestion => {
+    const file = normalizeSuggestionPath(suggestion?.file);
+    if (!file || !(suggestion.line_start > 0)) {
+      logger.warn(`Skipping suggestion for ${suggestion?.file || 'unknown file'}:${suggestion?.line_start || 'unknown line'} - missing valid line or path information`);
+      return [];
+    }
+    const resolved = resolveChangedFile(suggestion.file);
+    if (!resolved) {
+      logger.warn(`Skipping GitHub inline suggestion for ${file}:${suggestion.line_start} - file is outside the PR diff; finding remains available in pair-review`);
+      return [];
+    }
+    return [{ ...suggestion, file: resolved }];
+  });
+  const githubComments = validSuggestions.map(suggestion => ({
+    path: suggestion.file,
+    line: suggestion.line_start,
+    body: formatAISuggestion(suggestion.body, suggestion.type),
+    side: suggestion.side || 'RIGHT',
+    isFileLevel: false
+  }));
+  return { validSuggestions, githubComments };
+}
+
 /**
  * Shared implementation for headless (non-interactive) review modes.
  * Used by both --ai-draft and --ai-review.
@@ -1468,23 +1496,7 @@ async function performHeadlessReview(args, config, db, flags, options, externalP
       ]);
       const gitattributes = await getGeneratedFilePatterns(worktreePath);
 
-      changedFiles = diffSummary.files.map(file => {
-        const resolvedFile = resolveRenamedFile(file.file);
-        const isRenamed = resolvedFile !== file.file;
-        const result = {
-          file: resolvedFile,
-          insertions: file.insertions,
-          deletions: file.deletions,
-          changes: file.changes,
-          binary: file.binary || false,
-          generated: gitattributes.isGenerated(resolvedFile)
-        };
-        if (isRenamed) {
-          result.renamed = true;
-          result.renamedFrom = resolveRenamedFileOld(file.file);
-        }
-        return result;
-      });
+      changedFiles = buildChangedFileEntries(diffSummary.files, gitattributes);
     } else {
       // Use worktree approach - only use cwd if it matches the target repo
       const currentDir = parser.getCurrentDirectory();
@@ -1688,6 +1700,7 @@ async function performHeadlessReview(args, config, db, flags, options, externalP
         line_start,
         body,
         diff_position,
+        side,
         title,
         type
       FROM comments
@@ -1702,40 +1715,16 @@ async function performHeadlessReview(args, config, db, flags, options, externalP
       return; // Exit gracefully without creating a review
     }
 
-    // Filter out suggestions without valid line information
-    // Note: diff positions will be recalculated fresh by GitHub client
-    const validSuggestions = aiSuggestions.filter(suggestion => {
-      const hasValidLine = suggestion.line_start && suggestion.line_start > 0;
-      const hasValidPath = suggestion.file && suggestion.file.trim() !== '';
+    // Unchanged-file findings are useful locally but cannot be GitHub inline
+    // comments. Keep them active in the database and report each skipped path.
+    const { validSuggestions, githubComments } = prepareHeadlessReviewComments(aiSuggestions, changedFiles, diff);
 
-      if (!hasValidLine || !hasValidPath) {
-        console.warn(`Skipping suggestion for ${suggestion.file || 'unknown file'}:${suggestion.line_start || 'unknown line'} - missing valid line or path information`);
-        return false;
-      }
-
-      return true;
-    });
-
-    console.log(`Filtered to ${validSuggestions.length} suggestions with valid line information`);
+    console.log(`Filtered to ${validSuggestions.length} suggestions in changed files with valid line information`);
 
     if (validSuggestions.length === 0) {
-      console.log('No suggestions with valid line information. Exiting without creating review.');
+      console.log('No suggestions in changed files with valid line information. Exiting without creating review.');
       return; // Exit gracefully without creating a review
     }
-
-    // Format AI suggestions for GitHub
-    const githubComments = validSuggestions.map(suggestion => {
-      // Format with emoji and category prefix, same as adopted suggestions
-      const formattedBody = formatAISuggestion(suggestion.body, suggestion.type);
-
-      return {
-        path: suggestion.file,
-        line: suggestion.line_start,
-        body: formattedBody,
-        side: 'RIGHT',    // AI suggestions always target added/modified code
-        isFileLevel: false // AI suggestions always target specific lines
-      };
-    });
 
     // Build review body with AI-generated summary
     const footerFlag = options.mode === 'draft' ? '--ai-draft' : '--ai-review';
@@ -2117,23 +2106,7 @@ async function preparePrHeadless(db, config, flags, prArgs, externalPoolLifecycl
       ...GIT_DIFF_SUMMARY_FLAGS_ARRAY
     ]);
     const gitattributes = await getGeneratedFilePatterns(worktreePath);
-    changedFiles = diffSummary.files.map(file => {
-      const resolvedFile = resolveRenamedFile(file.file);
-      const isRenamed = resolvedFile !== file.file;
-      const result = {
-        file: resolvedFile,
-        insertions: file.insertions,
-        deletions: file.deletions,
-        changes: file.changes,
-        binary: file.binary || false,
-        generated: gitattributes.isGenerated(resolvedFile)
-      };
-      if (isRenamed) {
-        result.renamed = true;
-        result.renamedFrom = resolveRenamedFileOld(file.file);
-      }
-      return result;
-    });
+    changedFiles = buildChangedFileEntries(diffSummary.files, gitattributes);
   } else {
     const currentDir = parser.getCurrentDirectory();
     const isMatchingRepo = await parser.isMatchingRepository(currentDir, prInfo.owner, prInfo.repo);
@@ -3036,4 +3009,4 @@ if (require.main === module) {
   main();
 }
 
-module.exports = { main, parseArgs, detectPRFromGitHubEnvironment, printCouncilList, handleHeadlessAnalysis, handleHeadlessDelegated, runHeadlessAnalysis, buildHeadlessJson, buildHeadlessErrorJson, emitHeadlessResult, resolveCliInstructions, resolveCliBindingRepository, startPoolBackgroundFetches, isPoolEntryDueForFetch, POOL_FETCH_TICK_MS, MAX_POOL_FETCH_BACKOFF_MS };
+module.exports = { main, parseArgs, detectPRFromGitHubEnvironment, printCouncilList, handleHeadlessAnalysis, handleHeadlessDelegated, runHeadlessAnalysis, buildHeadlessJson, buildHeadlessErrorJson, emitHeadlessResult, prepareHeadlessReviewComments, resolveCliInstructions, resolveCliBindingRepository, startPoolBackgroundFetches, isPoolEntryDueForFetch, POOL_FETCH_TICK_MS, MAX_POOL_FETCH_BACKOFF_MS };

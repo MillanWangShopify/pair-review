@@ -25,7 +25,10 @@ const defaults = {
 
 /**
  * Count '+' lines in parsed hunks to gate summary generation by added-line volume.
- * Hunk-header lines are not '+'-prefixed by `parseUnifiedDiffHunks`, so this is safe.
+ * `parseUnifiedDiffHunks` keeps only hunk-body lines (everything after an `@@`
+ * header in a per-file patch), so every '+' line is an addition — including an
+ * added `++ x` line, which the diff spells `+++ x`. File headers never reach
+ * `hunk.lines`, so no `+++` exclusion is needed (and one would drop content).
  * @param {Map<string, Array<{header: string, lines: string[]}>>} hunksByFile
  * @returns {number}
  */
@@ -34,7 +37,7 @@ function countAddedLines(hunksByFile) {
   for (const hunks of hunksByFile.values()) {
     for (const hunk of hunks) {
       for (const line of hunk.lines) {
-        if (line.startsWith('+') && !line.startsWith('+++')) total++;
+        if (line.startsWith('+')) total++;
       }
     }
   }

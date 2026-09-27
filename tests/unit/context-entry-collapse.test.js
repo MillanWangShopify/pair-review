@@ -65,6 +65,7 @@ function createManager() {
   manager.viewedFiles = new Set();
   manager.saveViewedState = vi.fn();
   manager.ensureFileBodyRendered = vi.fn().mockResolvedValue(undefined);
+  manager.loadAISuggestions = vi.fn().mockResolvedValue(undefined);
   manager.pierreBridge = null;
   return manager;
 }
@@ -226,6 +227,12 @@ describe('context entry collapse independence (#540)', () => {
       renderableManager();
     });
 
+    it('loads the working-tree version of the context file', async () => {
+      await manager.renderContextFile({ id: 1, file: FILE, line_start: 1, line_end: 3 });
+
+      expect(manager.fetchFileContent).toHaveBeenCalledWith(FILE, { worktree: true });
+    });
+
     it('does not render the viewed checkbox checked from the diff entry state', async () => {
       manager.viewedFiles.add(FILE); // diff marked viewed
 
@@ -310,6 +317,33 @@ describe('context entry collapse independence (#540)', () => {
       await manager.loadContextFiles();
 
       expect(manager.renderContextFile).toHaveBeenCalledWith(row);
+    });
+
+    it('reanchors suggestions once after all new context files and comments render', async () => {
+      manager.diffFiles = [];
+      manager.selectedRunId = 'historical-run';
+      const rows = [
+        { id: 1, file: 'outside.js', line_start: 1, line_end: 10 },
+        { id: 2, file: 'other.js', line_start: 20, line_end: 30 },
+      ];
+      stubContextFilesResponse(rows);
+      const order = [];
+      manager.renderContextFile.mockImplementation(async row => { order.push(row.file); });
+      manager.loadUserComments.mockImplementation(async () => { order.push('comments'); });
+      manager.loadAISuggestions.mockImplementation(async () => { order.push('suggestions'); });
+
+      await manager.loadContextFiles();
+
+      expect(order).toEqual(['outside.js', 'other.js', 'comments', 'suggestions']);
+      expect(manager.loadAISuggestions).toHaveBeenCalledWith(null, 'historical-run');
+      await manager.loadContextFiles();
+      expect(manager.loadAISuggestions).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not reload suggestions after a failed context-file fetch', async () => {
+      globalThis.fetch = vi.fn().mockResolvedValue({ ok: false });
+      await manager.loadContextFiles();
+      expect(manager.loadAISuggestions).not.toHaveBeenCalled();
     });
   });
 

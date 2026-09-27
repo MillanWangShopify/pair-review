@@ -37,6 +37,8 @@ function loadPierreBridge({
   global.window = {
     matchMedia: vi.fn(() => ({ matches: false })),
     navigator: { hardwareConcurrency: 4 },
+    // pr.html / local.html load GitPaths before the bridge.
+    GitPaths: require('../../public/js/utils/git-paths.js'),
     PierreDiffs: {
       FileDiff,
       WorkerPoolManager,

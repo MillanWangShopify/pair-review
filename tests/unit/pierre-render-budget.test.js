@@ -1,8 +1,10 @@
 // Copyright 2026 Tim Perkins (tjwp) | SPDX-License-Identifier: Apache-2.0
+// @vitest-environment jsdom
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { JSDOM } from 'jsdom';
 
 const { PRManager } = require('../../public/js/pr.js');
+const { SuggestionManager } = require('../../public/js/modules/suggestion-manager.js');
 
 const DEFAULTS = {
   PIERRE_HIGHLIGHT_MAX_PATCH_CHARS: PRManager.PIERRE_HIGHLIGHT_MAX_PATCH_CHARS,
@@ -37,6 +39,8 @@ function createManager({ worker = true } = {}) {
   manager._pierreContentUpgradePromises = new Map();
   manager._deferredDiffRenderPromises = new Map();
   manager._yieldForDiffWork = () => Promise.resolve();
+  manager.loadUserComments = vi.fn(async () => {});
+  manager.loadAISuggestions = vi.fn(async () => {});
   return manager;
 }
 
@@ -405,7 +409,7 @@ describe('PRManager Pierre render budgeting', () => {
     // Finding 3: the click handler must go through _materializeDeferredDiff so it
     // shares the render-promise cache and de-dupes with auto-materialize. Because
     // a manual click is not inside a loadUserComments/loadAISuggestions flow, it
-    // must render with reanchor:true.
+    // must re-anchor after the shared render completes.
     const dom = new JSDOM(`
       <!doctype html>
       <div class="d2h-file-wrapper" data-file-name="src/huge.js"></div>
@@ -428,9 +432,7 @@ describe('PRManager Pierre render budgeting', () => {
     const button = placeholder.querySelector('.large-diff-load-btn');
     button.click();
 
-    // Let the async click handler and the queued render microtasks drain.
-    await new Promise(resolve => setTimeout(resolve, 0));
-    await Promise.resolve();
+    await materializeSpy.mock.results[0].value;
 
     expect(materializeSpy).toHaveBeenCalledWith('src/huge.js', { reanchor: true });
     expect(button.disabled).toBe(true);
@@ -439,14 +441,15 @@ describe('PRManager Pierre render budgeting', () => {
       file,
       wrapper,
       placeholder,
-      { reanchor: true }
+      { reanchor: false }
     );
+    expect(manager.loadAISuggestions).toHaveBeenCalledTimes(1);
   });
 
   it('de-dupes concurrent materialize calls for the same file into a single render', async () => {
     // Finding 3: two concurrent triggers for the same file must share the
     // _deferredDiffRenderPromises cache and produce exactly one _renderDeferredDiff.
-    // The first call wins its reanchor setting.
+    // Only the initiating manual call re-anchors, after shared rendering.
     const dom = new JSDOM(`
       <!doctype html>
       <div class="d2h-file-wrapper" data-file-name="src/huge.js">
@@ -476,8 +479,121 @@ describe('PRManager Pierre render budgeting', () => {
       file,
       document.querySelector('.d2h-file-wrapper'),
       document.querySelector('.large-diff-placeholder'),
-      { reanchor: true }
+      { reanchor: false }
     );
+    expect(manager.loadAISuggestions).toHaveBeenCalledTimes(1);
+  });
+
+  it('re-anchors a manual caller joining an automatic deferred render', async () => {
+    const dom = new JSDOM(`<!doctype html>
+      <div class="d2h-file-wrapper" data-file-name="src/huge.js">
+        <div class="large-diff-placeholder"></div>
+      </div>`, { url: 'http://localhost/' });
+    global.window = dom.window;
+    global.document = dom.window.document;
+    const manager = createManager({ worker: true });
+    const file = fileWithPatch('x'.repeat(220));
+    file.file = 'src/huge.js';
+    manager.changedFilesByPath.set(file.file, file);
+    manager.findFileElement = vi.fn(() => document.querySelector('.d2h-file-wrapper'));
+    let release;
+    manager._renderDeferredDiff = vi.fn(() => new Promise(resolve => { release = resolve; }));
+    const automatic = manager._materializeDeferredDiff(file.file);
+    const manual = manager._materializeDeferredDiff(file.file, { reanchor: true });
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+    release(true);
+    await Promise.all([automatic, manual]);
+    expect(manager._renderDeferredDiff).toHaveBeenCalledTimes(1);
+    expect(manager.loadAISuggestions).toHaveBeenCalledTimes(1);
+  });
+
+  it('finishes a manual deferred render overlapping an actual suggestion display', async () => {
+    const dom = new JSDOM(`
+      <div class="d2h-file-wrapper" data-file-name="src/huge.js">
+        <div class="large-diff-placeholder"></div>
+      </div>
+    `, { url: 'http://localhost/' });
+    global.window = dom.window;
+    global.document = dom.window.document;
+    try {
+      const manager = createManager();
+      const file = { file: 'src/huge.js', patch: 'x'.repeat(220) };
+      manager.changedFilesByPath.set(file.file, file);
+      manager.findFileElement = () => document.querySelector('.d2h-file-wrapper');
+      manager.ensureFileBodyRendered = vi.fn(async () => {});
+      manager._registerPierreHunkAnchorsForFile = vi.fn();
+      manager.pierreBridge.renderFile = vi.fn(() => manager.pierreBridge.files.set(file.file, {}));
+      manager.pierreBridge.removeAnnotationsByType = vi.fn();
+      manager.pierreBridge.addAnnotations = vi.fn();
+      manager.pierreBridge.isLineVisible = () => true;
+      window.aiPanel = { addFindings: vi.fn() };
+      const suggestionManager = Object.create(SuggestionManager.prototype);
+      suggestionManager.prManager = manager;
+      suggestionManager._closeReasoningPopover = vi.fn();
+      manager.suggestionManager = suggestionManager;
+      const findings = id => [{ id, file: file.file, line_start: 2, line_end: 2 }];
+      let queuedDuringDisplay = false;
+      manager.loadAISuggestions = vi.fn(() => {
+        queuedDuringDisplay = suggestionManager._isDisplayingSuggestions;
+        return manager.displayAISuggestions(findings('reanchored'));
+      });
+
+      let releaseRender;
+      manager._yieldForDiffWork = () => new Promise(resolve => { releaseRender = resolve; });
+      let enteredAuto;
+      const autoStarted = new Promise(resolve => { enteredAuto = resolve; });
+      const materialize = manager._materializeDeferredDiff.bind(manager);
+      manager._materializeDeferredDiff = (filePath, options) => {
+        const result = materialize(filePath, options);
+        if (!options?.reanchor) enteredAuto();
+        return result;
+      };
+
+      const manual = manager._materializeDeferredDiff(file.file, { reanchor: true });
+      const display = manager.displayAISuggestions(findings('initial'));
+      await autoStarted;
+      releaseRender();
+      await Promise.all([manual, display]);
+
+      expect(queuedDuringDisplay).toBe(true);
+      expect(manager.pierreBridge.renderFile).toHaveBeenCalledTimes(1);
+      expect(manager.loadAISuggestions).toHaveBeenCalledTimes(1);
+      expect(window.aiPanel.addFindings).toHaveBeenLastCalledWith(findings('reanchored'));
+      expect(suggestionManager._isDisplayingSuggestions).toBe(false);
+      expect(suggestionManager._pendingSuggestionsCompletion).toBeFalsy();
+      expect(manager._deferredDiffRenderPromises.size).toBe(0);
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it('does not re-anchor a failed render and allows a retry', async () => {
+    const dom = new JSDOM(`
+      <div class="d2h-file-wrapper" data-file-name="src/huge.js">
+        <div class="large-diff-placeholder"></div>
+      </div>
+    `, { url: 'http://localhost/' });
+    global.window = dom.window;
+    global.document = dom.window.document;
+    try {
+      const manager = createManager();
+      const file = { file: 'src/huge.js', patch: 'x'.repeat(220) };
+      manager.changedFilesByPath.set(file.file, file);
+      manager.findFileElement = () => document.querySelector('.d2h-file-wrapper');
+      manager._registerPierreHunkAnchorsForFile = vi.fn();
+      manager.pierreBridge.renderFile = vi.fn()
+        .mockImplementationOnce(() => { throw new Error('Render failed'); })
+        .mockImplementationOnce(() => manager.pierreBridge.files.set(file.file, {}));
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+
+      await expect(manager._materializeDeferredDiff(file.file, { reanchor: true })).resolves.toBe(false);
+      expect(manager.loadAISuggestions).not.toHaveBeenCalled();
+      expect(manager._deferredDiffRenderPromises.size).toBe(0);
+      await expect(manager._materializeDeferredDiff(file.file, { reanchor: true })).resolves.toBe(true);
+      expect(manager.loadAISuggestions).toHaveBeenCalledTimes(1);
+    } finally {
+      dom.window.close();
+    }
   });
 
   it('bails without clobbering file state when the review is rebuilt during the idle yield', async () => {
@@ -512,13 +628,14 @@ describe('PRManager Pierre render budgeting', () => {
     const yieldGate = new Promise(resolve => { releaseYield = resolve; });
     manager._yieldForDiffWork = vi.fn(() => yieldGate);
 
-    const materialize = manager._materializeDeferredDiff(file.file);
+    const materialize = manager._materializeDeferredDiff(file.file, { reanchor: true });
     // renderDiff() clears diffContainer.innerHTML, detaching the placeholder.
     placeholder.remove();
     releaseYield();
 
     await expect(materialize).resolves.toBe(false);
     expect(manager._renderDeferredDiff).not.toHaveBeenCalled();
+    expect(manager.loadAISuggestions).not.toHaveBeenCalled();
     expect(manager.pierreBridge.files.has(file.file)).toBe(false);
   });
 });

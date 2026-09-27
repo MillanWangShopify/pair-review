@@ -107,6 +107,21 @@ describe('ensureContextFileForComment', () => {
     expect(constructorCalls).toBe(0);
   });
 
+  it('compares diff membership through the shared normalized path check', async () => {
+    // Same comparison as suggestion validation and the file-content source
+    // choice: `./` prefixes and Git rename spellings name the same file.
+    mockGetDiffFileList.mockResolvedValue(['src/{old.js => app.js}']);
+
+    const result = await ensureContextFileForComment(db, review, {
+      file: './src/app.js',
+      line_start: 10,
+      line_end: 20
+    });
+
+    expect(result).toEqual({ created: false, expanded: false });
+    expect(constructorCalls).toBe(0);
+  });
+
   it('should create a context file with padded range for a line comment on a non-diff file', async () => {
     mockGetDiffFileList.mockResolvedValue(['src/other.js']);
 

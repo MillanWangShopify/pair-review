@@ -166,6 +166,8 @@ describe('PierreBridge.renderFile parses the patch only once', () => {
     };
     global.window = {
       matchMedia: () => ({ matches: false }),
+      // pr.html / local.html load GitPaths before the bridge.
+      GitPaths: require('../../public/js/utils/git-paths.js'),
       PierreDiffs: {
         parsePatchFiles,
         getSingularPatch: () => null,

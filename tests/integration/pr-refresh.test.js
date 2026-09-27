@@ -14,8 +14,8 @@ import { listenOnLoopback, closeServer } from '../utils/loopback-server';
  * Mirror of `local-sessions.test.js > kickOff* on diff-changing endpoints`
  * but for POST /api/pr/:owner/:repo/:number/refresh. CLAUDE.md mandates
  * Local/PR parity for cross-cutting behavior; the PR path constructs a
- * non-trivial `reviewContext.changedFiles` (mapping through string /
- * filename / file / path fallbacks) that has no other test coverage.
+ * non-trivial `reviewContext.changedFiles` (the fresh entries merged with
+ * the fresh diff, then mapped to paths) that has no other test coverage.
  */
 
 const { GitWorktreeManager } = require('../../src/git/worktree');
@@ -166,21 +166,41 @@ describe('POST /api/pr/:owner/:repo/:number/refresh kickoffs', () => {
     });
   });
 
-  it('maps changedFiles through fallback shapes: string / filename / file / path', async () => {
-    // The PR refresh route maps `changedFiles` through the chain
-    //   typeof f === 'string' ? f : (f.filename || f.file || f.path)
-    // then drops falsy entries. This test makes that mapping observable by
-    // feeding a heterogeneous array via the GitWorktreeManager spy.
+  it('spells changedFiles like the refreshed diff, as every reader of the cached copy does', async () => {
+    // The refresh route merges the fresh changed-file entries with the fresh
+    // diff (like GET and the manual kickoff) before mapping them to paths:
+    // string entries pass through, a file literally named `a => b.md` that
+    // numstat misread as a rename is re-spelled, and a file present only in
+    // the diff is recovered.
     GitWorktreeManager.prototype.getChangedFiles.mockResolvedValueOnce([
       'plain-string.js',
-      { filename: 'has-filename.js', additions: 1 },
-      { file: 'has-file.js', additions: 1 },
-      { path: 'has-path.js', additions: 1 },
-      { unknown: 'shape' } // falsy → dropped by filter(Boolean)
+      { file: 'b.md', insertions: 1, deletions: 1, renamed: true, renamedFrom: 'a' }
     ]);
+    GitWorktreeManager.prototype.generateUnifiedDiff.mockResolvedValueOnce([
+      'diff --git a/plain-string.js b/plain-string.js',
+      '--- a/plain-string.js',
+      '+++ b/plain-string.js',
+      '@@ -1 +1 @@',
+      '-a',
+      '+b',
+      'diff --git a/a => b.md b/a => b.md',
+      '--- a/a => b.md',
+      '+++ b/a => b.md',
+      '@@ -1 +1 @@',
+      '-a',
+      '+b',
+      'diff --git a/diff-only.js b/diff-only.js',
+      '--- a/diff-only.js',
+      '+++ b/diff-only.js',
+      '@@ -1 +1 @@',
+      '-a',
+      '+b',
+      ''
+    ].join('\n'));
 
     const res = await request(server).post('/api/pr/owner/repo/1/refresh').send({});
     expect(res.status).toBe(200);
+    expect(res.body.data.file_changes).toBe(3);
 
     await new Promise((resolve) => setImmediate(resolve));
 
@@ -188,9 +208,8 @@ describe('POST /api/pr/:owner/:repo/:number/refresh kickoffs', () => {
     const summaryArgs = summarySpy.mock.calls[0][0];
     expect(summaryArgs.reviewContext.changedFiles).toEqual([
       'plain-string.js',
-      'has-filename.js',
-      'has-file.js',
-      'has-path.js'
+      'a => b.md',
+      'diff-only.js'
     ]);
   });
 });

@@ -1,5 +1,6 @@
 // Copyright 2026 Tim Perkins (tjwp) | SPDX-License-Identifier: Apache-2.0
 const { getDiffFileList } = require('./diff-file-list');
+const { createChangedFilePredicate } = require('./changed-file-membership');
 const { ContextFileRepository } = require('../database');
 const logger = require('./logger');
 
@@ -8,7 +9,7 @@ const FILE_COMMENT_DEFAULT_LINES = 50;
 const MAX_RANGE = 500;
 
 /**
- * Ensure a context file entry exists for a comment that targets a file
+ * Ensure a context file entry exists for feedback that targets a file
  * outside the review's diff. If the file IS in the diff, this is a no-op.
  *
  * @param {object} db       - SQLite database handle
@@ -19,11 +20,14 @@ const MAX_RANGE = 500;
  * @param {number|null} opts.line_end   - End line
  * @returns {Promise<{created: boolean, expanded: boolean, contextFileId?: number}>}
  */
-async function ensureContextFileForComment(db, review, { file, line_start, line_end }) {
+async function ensureContextFile(db, review, {
+  file, line_start, line_end, label = 'Auto-added for comment', diffFiles: knownDiffFiles,
+  reuseFile = false
+}) {
   try {
     // 1. If the file is already in the diff, nothing to do
-    const diffFiles = await getDiffFileList(db, review);
-    if (diffFiles.includes(file)) {
+    const diffFiles = knownDiffFiles ?? await getDiffFileList(db, review);
+    if (createChangedFilePredicate(diffFiles)(file)) {
       return { created: false, expanded: false };
     }
 
@@ -45,6 +49,12 @@ async function ensureContextFileForComment(db, review, { file, line_start, line_
     // 4. Look up existing context file entries for this file
     const contextFileRepo = new ContextFileRepository(db);
     const existing = await contextFileRepo.getByReviewIdAndFile(review.id, file);
+
+    // Suggestions seed one window per file. The browser expands every finding's
+    // range, including distant findings, without creating additional wrappers.
+    if (reuseFile && existing.length > 0) {
+      return { created: false, expanded: false };
+    }
 
     if (existing.length > 0) {
       // 5. Check if ANY existing entry already covers the desired range
@@ -75,9 +85,10 @@ async function ensureContextFileForComment(db, review, { file, line_start, line_
     }
 
     // 8. No existing entry — create one
-    const inserted = await contextFileRepo.add(
-      review.id, file, desiredStart, desiredEnd, 'Auto-added for comment'
+    const inserted = await contextFileRepo[reuseFile ? 'addIfFileMissing' : 'add'](
+      review.id, file, desiredStart, desiredEnd, label
     );
+    if (!inserted) return { created: false, expanded: false };
     return { created: true, expanded: false, contextFileId: inserted.id };
   } catch (err) {
     logger.warn(`[AutoContext] Failed to ensure context file: ${err.message}`);
@@ -85,4 +96,7 @@ async function ensureContextFileForComment(db, review, { file, line_start, line_
   }
 }
 
-module.exports = { ensureContextFileForComment };
+// Preserve the comment callers' existing range expansion behavior.
+const ensureContextFileForComment = ensureContextFile;
+
+module.exports = { ensureContextFile, ensureContextFileForComment };

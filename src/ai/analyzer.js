@@ -10,23 +10,24 @@ const execPromise = util.promisify(exec);
 const logger = require('../utils/logger');
 const { extractJSON } = require('../utils/json-extractor');
 const { getGeneratedFilePatterns } = require('../git/gitattributes');
-const { normalizePath, pathExistsInList, resolveRenamedFile } = require('../utils/paths');
-const { buildFileLineCountMap, validateSuggestionLineNumbers } = require('../utils/line-validation');
+const { buildFileLineCountMap } = require('../utils/line-validation');
 const { getPromptBuilder } = require('./prompts');
 const { formatValidFiles } = require('./prompts/shared/valid-files');
 const { ADVERSARIAL_VERIFICATION_SECTION } = require('./prompts/shared/adversarial-verification');
 const { GIT_DIFF_FLAGS } = require('../git/diff-flags');
+const { splitGitPathLines } = require('../utils/git-paths');
 const {
   buildAnalysisLineNumberGuidance,
   buildOrchestrationLineNumberGuidance: buildOrchestrationGuidance,
 } = require('./prompts/line-number-guidance');
 const { resolveTier } = require('./prompts/config');
 const { registerProcess, isAnalysisCancelled, CancellationError } = require('../routes/shared');
-const { AnalysisRunRepository, CommentRepository } = require('../database');
+const { AnalysisRunRepository, run: dbRun } = require('../database');
 const { mergeInstructions } = require('../utils/instructions');
 const { GitWorktreeManager } = require('../git/worktree');
 const { buildSparseCheckoutGuidance } = require('./prompts/sparse-checkout-guidance');
 const { generateDiffForExecutable } = require('../routes/executable-analysis');
+const { filterSuggestionPaths, validateAndFilterSuggestions, storeReviewSuggestions } = require('../utils/suggestion-storage');
 
 
 // GIT_DIFF_FLAGS imported from ../git/diff-flags
@@ -568,9 +569,9 @@ class Analyzer {
 
       // Build the promises array for each level based on enabledLevels
       const levelAnalyzers = [
-        () => this.analyzeLevel1Isolated(prId, runId, worktreePath, prMetadata, generatedPatterns, progressCallback, mergedInstructions, validFiles, { analysisId, tier, timeout: executionTimeout, logPrefix, reviewerNum }),
-        () => this.analyzeLevel2Isolated(prId, runId, worktreePath, prMetadata, generatedPatterns, progressCallback, mergedInstructions, validFiles, { analysisId, tier, timeout: executionTimeout, logPrefix, reviewerNum }),
-        () => this.analyzeLevel3Isolated(prId, runId, worktreePath, prMetadata, generatedPatterns, progressCallback, mergedInstructions, validFiles, { analysisId, tier, timeout: executionTimeout, logPrefix, reviewerNum })
+        () => this.analyzeLevel1Isolated(prId, runId, worktreePath, prMetadata, generatedPatterns, progressCallback, mergedInstructions, validFiles, { analysisId, tier, timeout: executionTimeout, logPrefix, reviewerNum, fileLineCountMap }),
+        () => this.analyzeLevel2Isolated(prId, runId, worktreePath, prMetadata, generatedPatterns, progressCallback, mergedInstructions, validFiles, { analysisId, tier, timeout: executionTimeout, logPrefix, reviewerNum, fileLineCountMap }),
+        () => this.analyzeLevel3Isolated(prId, runId, worktreePath, prMetadata, generatedPatterns, progressCallback, mergedInstructions, validFiles, { analysisId, tier, timeout: executionTimeout, logPrefix, reviewerNum, fileLineCountMap })
       ];
 
       const analysisPromises = [1, 2, 3].map((level, idx) => {
@@ -670,15 +671,15 @@ class Analyzer {
         }
 
         // Validate and finalize suggestions
-        const finalSuggestions = this.validateAndFinalizeSuggestions(
+        const finalSuggestions = await this.validateAndFinalizeSuggestions(
           orchestrationResult.suggestions,
           fileLineCountMap,
-          validFiles
+          validFiles, worktreePath
         );
 
         // Store orchestrated results with ai_level = NULL (final suggestions)
         logger.info(`${logPrefix}Storing consolidated suggestions in database...`);
-        await this.storeSuggestions(prId, runId, finalSuggestions, null, validFiles);
+        await this.storeSuggestions(prId, runId, finalSuggestions, null, validFiles, { preparedSuggestions: finalSuggestions });
 
         // Check if analysis was cancelled before updating DB status
         if (analysisId && isAnalysisCancelled(analysisId)) {
@@ -736,13 +737,13 @@ class Analyzer {
         ];
 
         // Validate and finalize suggestions
-        const finalFallbackSuggestions = this.validateAndFinalizeSuggestions(
+        const finalFallbackSuggestions = await this.validateAndFinalizeSuggestions(
           fallbackSuggestions,
           fileLineCountMap,
-          validFiles
+          validFiles, worktreePath
         );
 
-        await this.storeSuggestions(prId, runId, finalFallbackSuggestions, null, validFiles);
+        await this.storeSuggestions(prId, runId, finalFallbackSuggestions, null, validFiles, { preparedSuggestions: finalFallbackSuggestions });
 
         // Check if analysis was cancelled before updating DB status
         if (analysisId && isAnalysisCancelled(analysisId)) {
@@ -818,55 +819,17 @@ class Analyzer {
    * @param {Array} suggestions - Array of suggestion objects
    * @param {Map<string, number>} fileLineCountMap - Map of file paths to line counts
    * @param {Array<string>} validFiles - List of valid file paths from the PR diff
-   * @returns {Array} Finalized suggestions (valid + converted)
+   * @param {string|null} repoRoot - Review checkout for validating unchanged files
+   * @returns {Promise<Array>} Finalized suggestions (valid + converted)
    */
-  validateAndFinalizeSuggestions(suggestions, fileLineCountMap, validFiles) {
-    const inputCount = suggestions?.length || 0;
-    logger.info(`[Validation] Starting validation with ${inputCount} input suggestions`);
-
-    // Validate suggestion file paths against PR diff
-    const validatedSuggestions = this.validateSuggestionFilePaths(
-      suggestions,
-      validFiles
-    );
-
-    const afterPathValidation = validatedSuggestions.length;
-    if (afterPathValidation < inputCount) {
-      logger.info(`[Validation] After file path validation: ${afterPathValidation} suggestions (${inputCount - afterPathValidation} filtered)`);
+  async validateAndFinalizeSuggestions(suggestions, fileLineCountMap, validFiles, repoRoot = null) {
+    logger.info(`[Validation] Starting validation with ${suggestions?.length || 0} input suggestions`);
+    const result = await validateAndFilterSuggestions(suggestions, validFiles, fileLineCountMap, repoRoot);
+    if (suggestions?.length && result.length === 0) {
+      logger.warn(`[Validation] WARNING: All ${suggestions.length} suggestions were filtered out!`);
     }
-
-    // Line number validation with conversion to file-level
-    const lineValidationResult = validateSuggestionLineNumbers(
-      validatedSuggestions,
-      fileLineCountMap,
-      { convertToFileLevel: true }
-    );
-
-    if (lineValidationResult.converted.length > 0) {
-      logger.warn(`[Line Validation] Converted ${lineValidationResult.converted.length} suggestions to file-level due to invalid line numbers`);
-    }
-
-    const finalCount = lineValidationResult.valid.length + lineValidationResult.converted.length;
-    logger.info(`[Validation] Final: ${finalCount} suggestions (${lineValidationResult.valid.length} valid, ${lineValidationResult.converted.length} converted)`);
-
-    // Debug: If all suggestions were filtered out, log details
-    if (finalCount === 0 && inputCount > 0) {
-      logger.warn(`[Validation] WARNING: All ${inputCount} suggestions were filtered out!`);
-      logger.warn(`[Validation] File path filtering removed: ${inputCount - afterPathValidation}`);
-      // Note: With convertToFileLevel=true, invalid line numbers are converted (not dropped)
-      // Log both converted and dropped counts for clarity
-      const droppedCount = lineValidationResult.dropped?.length || 0;
-      const convertedCount = lineValidationResult.converted?.length || 0;
-      if (droppedCount > 0) {
-        logger.warn(`[Validation] Line validation dropped: ${droppedCount}`);
-      }
-      if (convertedCount > 0) {
-        logger.warn(`[Validation] Line validation converted to file-level: ${convertedCount}`);
-      }
-    }
-
-    // Return valid + converted suggestions
-    return [...lineValidationResult.valid, ...lineValidationResult.converted];
+    logger.info(`[Validation] Final: ${result.length} suggestions from ${suggestions?.length || 0} input`);
+    return result;
   }
 
   /**
@@ -1006,7 +969,7 @@ Do NOT create suggestions for any files not in this list. If you cannot find iss
         `git diff ${GIT_DIFF_FLAGS} ${prMetadata.base_sha}...${prMetadata.head_sha} --name-only`,
         { cwd: worktreePath }
       );
-      return stdout.trim().split('\n').filter(f => f.length > 0);
+      return splitGitPathLines(stdout);
     } catch (error) {
       logger.warn(`Could not get changed files list: ${error.message}`);
       return [];
@@ -1014,101 +977,15 @@ Do NOT create suggestions for any files not in this list. If you cannot find iss
   }
 
   /**
-   * Get list of changed files for local mode analysis.
-   * By default includes unstaged changes and untracked files.
-   * When `options.includeStaged` is true, also includes staged (git add'd) files.
-   *
-   * @param {string} localPath - Path to the local git repository
-   * @param {Object} [options]
-   * @param {boolean} [options.includeStaged] - Also include staged files
-   * @returns {Promise<Array<string>>} List of changed file paths
-   */
-  async getLocalChangedFiles(localPath, options = {}) {
-    try {
-      // Get modified tracked files (unstaged)
-      const { stdout: unstaged } = await execPromise(
-        `git diff ${GIT_DIFF_FLAGS} --name-only`,
-        { cwd: localPath }
-      );
-
-      // Get untracked files
-      const { stdout: untracked } = await execPromise(
-        'git ls-files --others --exclude-standard',
-        { cwd: localPath }
-      );
-
-      const unstagedFiles = unstaged.trim().split('\n').filter(f => f.length > 0);
-      const untrackedFiles = untracked.trim().split('\n').filter(f => f.length > 0);
-      const allFiles = [...unstagedFiles, ...untrackedFiles];
-
-      // Include staged files when scope includes staged
-      if (options.includeStaged) {
-        const { stdout: staged } = await execPromise(
-          `git diff ${GIT_DIFF_FLAGS} --cached --name-only`,
-          { cwd: localPath }
-        );
-        const stagedFiles = staged.trim().split('\n').filter(f => f.length > 0);
-        allFiles.push(...stagedFiles);
-      }
-
-      return [...new Set(allFiles)];
-    } catch (error) {
-      logger.warn(`Could not get local changed files for ${localPath}: ${error.message}`);
-      return [];
-    }
-  }
-
-  /**
-   * Validate suggestion file paths against the PR diff
-   * Filters out suggestions that reference files not in the PR diff
+   * Validate paths against changed files or existing files under the review root
    *
    * @param {Array} suggestions - Array of suggestions to validate
    * @param {Array<string>} validPaths - List of valid file paths from the PR diff
+   * @param {string|null} repoRoot - Review checkout for validating unchanged files
    * @returns {Array} Filtered suggestions with only valid file paths
    */
-  validateSuggestionFilePaths(suggestions, validPaths) {
-    if (!suggestions || suggestions.length === 0) {
-      return [];
-    }
-
-    if (!validPaths || validPaths.length === 0) {
-      logger.warn('[Validation] No valid paths provided for validation, skipping path filtering');
-      return suggestions;
-    }
-
-    // Create a Set of normalized valid paths for efficient lookup
-    // Resolve git rename syntax (e.g., "tests/{old.js => new.js}" → "tests/new.js")
-    // so both the rename syntax path and the plain new filename will match
-    const normalizedValidPaths = new Set(validPaths.map(p => normalizePath(resolveRenamedFile(p))));
-
-    const validSuggestions = [];
-    const discardedSuggestions = [];
-
-    for (const suggestion of suggestions) {
-      const normalizedSuggestionPath = normalizePath(resolveRenamedFile(suggestion.file));
-
-      if (normalizedValidPaths.has(normalizedSuggestionPath)) {
-        validSuggestions.push(suggestion);
-      } else {
-        discardedSuggestions.push({
-          file: suggestion.file,
-          normalizedPath: normalizedSuggestionPath,
-          title: suggestion.title,
-          type: suggestion.type
-        });
-      }
-    }
-
-    // Log discarded suggestions for debugging
-    if (discardedSuggestions.length > 0) {
-      logger.warn(`[Validation] Discarded ${discardedSuggestions.length} suggestion(s) with invalid file paths:`);
-      for (const discarded of discardedSuggestions) {
-        logger.warn(`  - "${discarded.file}" (normalized: "${discarded.normalizedPath}"): ${discarded.type} - ${discarded.title}`);
-      }
-      logger.info(`[Validation] Valid paths in PR diff: ${Array.from(normalizedValidPaths).slice(0, 10).join(', ')}${normalizedValidPaths.size > 10 ? '...' : ''}`);
-    }
-
-    return validSuggestions;
+  validateSuggestionFilePaths(suggestions, validPaths, repoRoot = null) {
+    return filterSuggestionPaths(suggestions, validPaths, repoRoot);
   }
 
   /**
@@ -1222,7 +1099,7 @@ Or simply ignore any changes to files matching these patterns in your analysis.
 
       // Validate suggestion file paths if changedFiles provided
       const suggestions = (changedFiles && changedFiles.length > 0)
-        ? this.validateSuggestionFilePaths(parsedSuggestions, changedFiles)
+        ? this.validateSuggestionFilePaths(parsedSuggestions, changedFiles, worktreePath)
         : parsedSuggestions;
       if (changedFiles && changedFiles.length > 0) {
         logger.success(`${lp}After path validation: ${suggestions.length} suggestions`);
@@ -1230,7 +1107,9 @@ Or simply ignore any changes to files matching these patterns in your analysis.
 
       // Store Level 1 suggestions
       updateProgress('Storing Level 1 suggestions in database');
-      await this.storeSuggestions(prId, runId, suggestions, 1, changedFiles);
+      await this.storeSuggestions(prId, runId, suggestions, 1, changedFiles, {
+        fileLineCountMap: options.fileLineCountMap, repoRoot: worktreePath
+      });
       logger.success(`${lp}Level 1 complete: ${suggestions.length} suggestions`);
 
       // Report completion to progress callback
@@ -2001,140 +1880,19 @@ If you are unsure, use "NEW" - it is correct for the vast majority of suggestion
    * @param {number|string} level - Analysis level
    * @param {Array<string>} changedFiles - Optional list of changed files for local mode fallback
    */
-  async storeSuggestions(reviewId, runId, suggestions, level, changedFiles = null) {
-    // FAILSAFE: Get valid file paths to filter suggestions against
-    // Prefer changedFiles parameter when available for performance (avoids DB lookup)
-    // Fallback to getValidFilePaths() which properly looks up pr_metadata via review.id
-    let validFilePaths;
-    if (changedFiles && changedFiles.length > 0) {
-      validFilePaths = changedFiles.map(f => normalizePath(resolveRenamedFile(f)));
-    } else {
-      // Fallback to pr_metadata lookup via review -> pr_metadata join
-      validFilePaths = await this.getValidFilePaths(reviewId);
-    }
-
-    // Create a Set of normalized valid paths for O(1) lookup
-    const validPathsSet = new Set(validFilePaths);
-
-    // Filter suggestions to only those with valid file paths
-    const validSuggestions = [];
-    let filteredCount = 0;
-
-    for (const suggestion of suggestions) {
-      // Check if the suggestion's file path exists in the PR diff
-      if (!this.isValidSuggestionPath(suggestion.file, validPathsSet)) {
-        filteredCount++;
-        logger.warn(
-          `[FAILSAFE] Filtered AI suggestion with invalid path: "${suggestion.file}" ` +
-          `(expected one of: ${validFilePaths.slice(0, 5).join(', ')}${validFilePaths.length > 5 ? '...' : ''})`
-        );
-        continue;
-      }
-      validSuggestions.push(suggestion);
-    }
-
-    if (filteredCount > 0) {
-      logger.warn(`[FAILSAFE] Filtered ${filteredCount} suggestions with invalid file paths`);
-    }
-
-    // Log overall suggestions at debug level (level === null means orchestrated/final suggestions)
-    // Short-circuit: check debug flag first to avoid string construction when disabled
+  async storeSuggestions(reviewId, runId, suggestions, level, changedFiles = null, options = {}) {
+    const stored = await storeReviewSuggestions(this.db, {
+      reviewId, runId, suggestions, level, changedFiles, ...options
+    });
     if (level === null && logger.isDebugEnabled()) {
-      for (const suggestion of validSuggestions) {
+      for (const suggestion of stored.suggestions) {
         const side = suggestion.old_or_new === 'OLD' ? 'LEFT' : 'RIGHT';
         const lineInfo = suggestion.line_start !== null ? `L${suggestion.line_start}` : 'file-level';
         logger.debug(`[Suggestion] ${suggestion.file}:${lineInfo} (${side}) - ${suggestion.title || '(no title)'}`);
       }
     }
-
-    // Delegate actual INSERT to CommentRepository
-    const commentRepo = new CommentRepository(this.db);
-    await commentRepo.bulkInsertAISuggestions(reviewId, runId, validSuggestions, level);
-
-    logger.success(`Stored ${validSuggestions.length} suggestions in database`);
-  }
-
-  /**
-   * Get valid file paths from PR metadata
-   * @param {number} reviewId - Review ID (from reviews table, NOT pr_metadata.id)
-   * @returns {Promise<Array<string>>} Array of valid file paths from the PR diff
-   */
-  async getValidFilePaths(reviewId) {
-    const { queryOne } = require('../database');
-
-    try {
-      // First, look up the review to get pr_number and repository
-      // reviewId is from the reviews table, not pr_metadata.id
-      const review = await queryOne(this.db, `
-        SELECT pr_number, repository, review_type FROM reviews WHERE id = ?
-      `, [reviewId]);
-
-      if (!review) {
-        logger.warn(`[FAILSAFE] Review not found for reviewId=${reviewId}`);
-        return [];
-      }
-
-      // For local mode reviews, there is no pr_metadata - return empty
-      if (review.review_type === 'local' || !review.pr_number) {
-        // This is expected for local mode - not a warning condition
-        return [];
-      }
-
-      // Now look up pr_metadata using the natural key (pr_number + repository)
-      const prMetadata = await queryOne(this.db, `
-        SELECT pr_data FROM pr_metadata WHERE pr_number = ? AND repository = ? COLLATE NOCASE
-      `, [review.pr_number, review.repository]);
-
-      if (!prMetadata || !prMetadata.pr_data) {
-        logger.warn(`[FAILSAFE] PR metadata not found for PR #${review.pr_number} in ${review.repository}`);
-        return [];
-      }
-
-      const prData = JSON.parse(prMetadata.pr_data);
-      const changedFiles = prData.changed_files || [];
-
-      // Extract file paths and normalize them
-      return changedFiles.map(f => {
-        // changed_files entries can be objects with 'file' property or just strings
-        const filePath = typeof f === 'string' ? f : (f.file || '');
-        return normalizePath(filePath);
-      }).filter(p => p.length > 0);
-
-    } catch (error) {
-      logger.error(`[FAILSAFE] Error getting valid file paths: ${error.message}`);
-      return [];
-    }
-  }
-
-  /**
-   * Check if a suggestion's file path is valid (exists in PR diff)
-   * @param {string} suggestionPath - The file path from the suggestion
-   * @param {Array<string>|Set<string>} validPaths - Array or Set of valid (normalized) file paths
-   * @returns {boolean} True if the path is valid
-   */
-  isValidSuggestionPath(suggestionPath, validPaths) {
-    // If we couldn't get valid paths, allow all suggestions (fail open for usability)
-    // This is a safety fallback - if PR metadata lookup fails, we don't want to
-    // discard all suggestions. Log prominently so this is visible for debugging.
-    if (!validPaths || (Array.isArray(validPaths) && validPaths.length === 0) || (validPaths instanceof Set && validPaths.size === 0)) {
-      logger.warn('[FAILSAFE] Path validation bypassed: no valid paths available. All suggestions will pass through unfiltered.');
-      return true;
-    }
-
-    // Check if the suggestion path is empty or invalid
-    if (!suggestionPath || typeof suggestionPath !== 'string') {
-      return false;
-    }
-
-    // Use O(1) Set lookup if validPaths is a Set, otherwise normalize and check
-    // Resolve git rename syntax so suggestions for renamed files match
-    const normalizedSuggestionPath = normalizePath(resolveRenamedFile(suggestionPath));
-    if (validPaths instanceof Set) {
-      return validPaths.has(normalizedSuggestionPath);
-    }
-    // Fallback for array (convert to Set for lookup)
-    const validPathsSet = new Set(validPaths.map(p => normalizePath(resolveRenamedFile(p))));
-    return validPathsSet.has(normalizedSuggestionPath);
+    logger.success(`Stored ${stored.suggestions.length} suggestions in database`);
+    return stored.suggestions;
   }
 
   /**
@@ -2234,12 +1992,14 @@ If you are unsure, use "NEW" - it is correct for the vast majority of suggestion
       logger.success(`${lp}Parsed ${suggestions.length} valid Level 2 suggestions`);
 
       // Validate suggestion file paths against changed files
-      suggestions = this.validateSuggestionFilePaths(suggestions, validFiles);
+      suggestions = this.validateSuggestionFilePaths(suggestions, validFiles, worktreePath);
       logger.success(`${lp}After path validation: ${suggestions.length} suggestions`);
 
       // Store Level 2 suggestions
       updateProgress('Storing Level 2 suggestions in database');
-      await this.storeSuggestions(prId, runId, suggestions, 2, validFiles);
+      await this.storeSuggestions(prId, runId, suggestions, 2, validFiles, {
+        fileLineCountMap: options.fileLineCountMap, repoRoot: worktreePath
+      });
       logger.success(`${lp}Level 2 complete: ${suggestions.length} suggestions`);
 
       // Report completion to progress callback
@@ -2350,12 +2110,14 @@ If you are unsure, use "NEW" - it is correct for the vast majority of suggestion
       logger.success(`${lp}Parsed ${suggestions.length} valid Level 3 suggestions`);
 
       // Validate suggestion file paths against changed files
-      suggestions = this.validateSuggestionFilePaths(suggestions, validFiles);
+      suggestions = this.validateSuggestionFilePaths(suggestions, validFiles, worktreePath);
       logger.success(`${lp}After path validation: ${suggestions.length} suggestions`);
 
       // Store Level 3 suggestions
       updateProgress('Storing Level 3 suggestions in database');
-      await this.storeSuggestions(prId, runId, suggestions, 3, validFiles);
+      await this.storeSuggestions(prId, runId, suggestions, 3, validFiles, {
+        fileLineCountMap: options.fileLineCountMap, repoRoot: worktreePath
+      });
       logger.success(`${lp}Level 3 complete: ${suggestions.length} suggestions`);
 
       // Report completion to progress callback
@@ -2410,7 +2172,7 @@ If you are unsure, use "NEW" - it is correct for the vast majority of suggestion
       // For local mode, use git diff HEAD; for PR mode, use base...head
       const diffCmd = this.buildGitDiffCommand(prMetadata, '--name-only');
       const { stdout: changedFiles } = await execPromise(diffCmd, { cwd: worktreePath });
-      const files = changedFiles.trim().split('\n').filter(f => f.length > 0);
+      const files = splitGitPathLines(changedFiles);
       
       const languages = this.detectLanguages(files);
       logger.info(`Detected languages: ${languages.join(', ')}`);
@@ -3219,8 +2981,8 @@ File-level suggestions should NOT have a line number. They apply to the entire f
           logPrefix: `[${reviewerLabel}] `
         });
 
-        const finalSuggestions = this.validateAndFinalizeSuggestions(result.suggestions, fileLineCountMap, validFiles);
-        await this.storeSuggestions(reviewId, parentRunId, finalSuggestions, null, validFiles);
+        const finalSuggestions = await this.validateAndFinalizeSuggestions(result.suggestions, fileLineCountMap, validFiles, worktreePath);
+        await this.storeSuggestions(reviewId, parentRunId, finalSuggestions, null, validFiles, { preparedSuggestions: finalSuggestions });
 
         if (progressCallback) {
           progressCallback({ level: 'exec', status: 'completed', progress: `External tool complete: ${finalSuggestions.length} suggestions` });
@@ -3301,7 +3063,6 @@ File-level suggestions should NOT have a line number. They apply to the entire f
     }
 
     // For each voice, create a child run and launch analysis
-    const commentRepo = new CommentRepository(this.db);
     const voicePromises = voices.map(async (voice, idx) => {
       const { voiceAnalyzer, voiceProvider, isExecutable, voiceKey, reviewerLabel, voiceRequestInstructions, voiceProgressCallback, voiceTier, voiceTimeout } =
         buildVoiceContext(voice, idx, instructions, progressCallback, this.db, this.providerOverrides, this.providerOverridesMap);
@@ -3340,7 +3101,7 @@ File-level suggestions should NOT have a line number. They apply to the entire f
           });
 
           // Validate suggestions before storage (matches single-voice path)
-          const validatedSuggestions = this.validateAndFinalizeSuggestions(result.suggestions, fileLineCountMap, validFiles);
+          const validatedSuggestions = await this.validateAndFinalizeSuggestions(result.suggestions, fileLineCountMap, validFiles, worktreePath);
 
           // Update child run
           try {
@@ -3355,7 +3116,7 @@ File-level suggestions should NOT have a line number. They apply to the entire f
           }
 
           // Store validated voice suggestions
-          await commentRepo.bulkInsertAISuggestions(reviewId, childRunId, validatedSuggestions, null);
+          await this.storeSuggestions(reviewId, childRunId, validatedSuggestions, null, validFiles, { preparedSuggestions: validatedSuggestions });
 
           if (voiceProgressCallback) {
             voiceProgressCallback({ level: 'exec', status: 'completed', progress: `External tool complete: ${validatedSuggestions.length} suggestions` });
@@ -3478,10 +3239,10 @@ File-level suggestions should NOT have a line number. They apply to the entire f
       // consolidation) — only cross-voice consolidation was skipped here
       const singleLevelOutcomes = singleResult.levelOutcomes || { consolidation: 'skipped' };
 
-      const finalSuggestions = this.validateAndFinalizeSuggestions(
-        singleResult.suggestions, fileLineCountMap, validFiles
+      const finalSuggestions = await this.validateAndFinalizeSuggestions(
+        singleResult.suggestions, fileLineCountMap, validFiles, worktreePath
       );
-      await this.storeSuggestions(reviewId, parentRunId, finalSuggestions, null, validFiles);
+      await this.storeSuggestions(reviewId, parentRunId, finalSuggestions, null, validFiles, { preparedSuggestions: finalSuggestions });
 
       try {
         await analysisRunRepo.update(parentRunId, {
@@ -3555,11 +3316,11 @@ File-level suggestions should NOT have a line number. They apply to the entire f
         { provider: consolProvider, model: consolModel, tier: consolTier, timeout: consolConfig.timeout, analysisId, progressCallback, excludePrevious, dedupContext, githubClient, providerOverrides: this.providerOverrides }
       );
 
-      const finalSuggestions = this.validateAndFinalizeSuggestions(
-        consolidated.suggestions, fileLineCountMap, validFiles
+      const finalSuggestions = await this.validateAndFinalizeSuggestions(
+        consolidated.suggestions, fileLineCountMap, validFiles, worktreePath
       );
 
-      await this.storeSuggestions(reviewId, parentRunId, finalSuggestions, null, validFiles);
+      await this.storeSuggestions(reviewId, parentRunId, finalSuggestions, null, validFiles, { preparedSuggestions: finalSuggestions });
 
       const summary = consolidated.summary || `Review council complete: ${finalSuggestions.length} suggestions from ${successfulVoices.length} reviewers`;
 
@@ -3613,10 +3374,10 @@ File-level suggestions should NOT have a line number. They apply to the entire f
       }
 
       // Fallback: use all voice suggestions combined
-      const fallbackSuggestions = this.validateAndFinalizeSuggestions(
-        [...allVoiceSuggestions, ...allVoiceFileLevelSuggestions], fileLineCountMap, validFiles
+      const fallbackSuggestions = await this.validateAndFinalizeSuggestions(
+        [...allVoiceSuggestions, ...allVoiceFileLevelSuggestions], fileLineCountMap, validFiles, worktreePath
       );
-      await this.storeSuggestions(reviewId, parentRunId, fallbackSuggestions, null, validFiles);
+      await this.storeSuggestions(reviewId, parentRunId, fallbackSuggestions, null, validFiles, { preparedSuggestions: fallbackSuggestions });
 
       const fallbackSummary = `Review council complete (consolidation failed): ${fallbackSuggestions.length} suggestions`;
 
@@ -3685,7 +3446,6 @@ File-level suggestions should NOT have a line number. They apply to the entire f
     logger.info(`[Council] Using ${validFiles.length} changed files for path validation`);
 
     // Build file line count map for validation
-    const { buildFileLineCountMap } = require('../utils/line-validation');
     const fileLineCountMap = await buildFileLineCountMap(worktreePath, validFiles);
 
     // Collect all voice tasks across enabled levels
@@ -3818,10 +3578,10 @@ File-level suggestions should NOT have a line number. They apply to the entire f
       logger.info('[Council] Single reviewer result — skipping consolidation');
       const singleLevel = [...successfulVoiceLevels][0];
       const singleLevelSuggestions = levelSuggestions[singleLevel] || [];
-      const finalSuggestions = this.validateAndFinalizeSuggestions(
-        singleLevelSuggestions, fileLineCountMap, validFiles
+      const finalSuggestions = await this.validateAndFinalizeSuggestions(
+        singleLevelSuggestions, fileLineCountMap, validFiles, worktreePath
       );
-      await this.storeSuggestions(reviewId, runId, finalSuggestions, null, validFiles);
+      await this.storeSuggestions(reviewId, runId, finalSuggestions, null, validFiles, { preparedSuggestions: finalSuggestions });
 
       return {
         runId,
@@ -3833,7 +3593,7 @@ File-level suggestions should NOT have a line number. They apply to the entire f
 
     // Store raw per-reviewer suggestions before consolidation
     logger.info(`[Council] Storing ${rawSuggestions.length} raw reviewer suggestions`);
-    await this._storeCouncilSuggestions(reviewId, runId, rawSuggestions, validFiles);
+    await this._storeCouncilSuggestions(reviewId, runId, rawSuggestions, validFiles, fileLineCountMap, worktreePath);
 
     // Determine orchestration provider
     const orchConfig = councilConfig.consolidation || councilConfig.orchestration || this._defaultOrchestration(councilConfig);
@@ -3945,12 +3705,12 @@ File-level suggestions should NOT have a line number. They apply to the entire f
           : { level: 'orchestration', status: 'completed', progress: 'Cross-level consolidation complete' });
       }
 
-      const finalSuggestions = this.validateAndFinalizeSuggestions(
-        orchestrationResult.suggestions, fileLineCountMap, validFiles
+      const finalSuggestions = await this.validateAndFinalizeSuggestions(
+        orchestrationResult.suggestions, fileLineCountMap, validFiles, worktreePath
       );
 
       // Store final consolidated suggestions (is_raw=0, voice_id=null)
-      await this.storeSuggestions(reviewId, runId, finalSuggestions, null, validFiles);
+      await this.storeSuggestions(reviewId, runId, finalSuggestions, null, validFiles, { preparedSuggestions: finalSuggestions });
 
       logger.success(`[Council] Analysis complete: ${finalSuggestions.length} final suggestions`);
 
@@ -3974,10 +3734,10 @@ File-level suggestions should NOT have a line number. They apply to the entire f
 
       // Fallback: combine all consolidated suggestions
       const fallbackSuggestions = Object.values(consolidatedPerLevel).flat();
-      const finalFallback = this.validateAndFinalizeSuggestions(
-        fallbackSuggestions, fileLineCountMap, validFiles
+      const finalFallback = await this.validateAndFinalizeSuggestions(
+        fallbackSuggestions, fileLineCountMap, validFiles, worktreePath
       );
-      await this.storeSuggestions(reviewId, runId, finalFallback, null, validFiles);
+      await this.storeSuggestions(reviewId, runId, finalFallback, null, validFiles, { preparedSuggestions: finalFallback });
 
       return {
         runId,
@@ -4158,59 +3918,49 @@ File-level suggestions should NOT have a line number. They apply to the entire f
    * @param {Array<string>} validFiles - Valid file paths
    * @private
    */
-  async _storeCouncilSuggestions(reviewId, runId, suggestions, validFiles) {
-    const { run: dbRun } = require('../database');
+  async _storeCouncilSuggestions(reviewId, runId, suggestions, validFiles, fileLineCountMap, repoRoot) {
+    const stored = await storeReviewSuggestions(this.db, {
+      reviewId, runId, suggestions, changedFiles: validFiles, fileLineCountMap,
+      repoRoot, seedContext: false,
+      insert: async (validSuggestions) => {
+        for (const suggestion of validSuggestions) {
+          const body = suggestion.description;
+          const suggestionText = suggestion.suggestion || null;
 
-    // FAILSAFE: Filter suggestions to only those with valid file paths (same as storeSuggestions)
-    const validPathsSet = new Set(validFiles.map(f => normalizePath(resolveRenamedFile(f))));
-    let filteredCount = 0;
+          const isFileLevel = suggestion.is_file_level === true || suggestion.line_start === null ? 1 : 0;
+          const side = suggestion.old_or_new === 'OLD' ? 'LEFT' : 'RIGHT';
 
-    for (const suggestion of suggestions) {
-      // Validate file path against changed files
-      if (!this.isValidSuggestionPath(suggestion.file, validPathsSet)) {
-        filteredCount++;
-        continue;
+          await dbRun(this.db, `
+            INSERT INTO comments (
+              review_id, source, author, ai_run_id, ai_level, ai_confidence,
+              file, line_start, line_end, side, type, title, body, suggestion_text, reasoning, status, is_file_level,
+              voice_id, is_raw
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `, [
+            reviewId,
+            'ai',
+            'AI Assistant',
+            runId,
+            suggestion.level || null, // ai_level
+            suggestion.confidence,
+            suggestion.file,
+            suggestion.line_start,
+            suggestion.line_end,
+            side,
+            suggestion.type,
+            suggestion.title,
+            body,
+            suggestionText,
+            suggestion.reasoning ? JSON.stringify(suggestion.reasoning) : null,
+            'active',
+            isFileLevel,
+            suggestion.voice_id || null,
+            suggestion.is_raw || 0
+          ]);
+        }
       }
-
-      const body = suggestion.description;
-      const suggestionText = suggestion.suggestion || null;
-
-      const isFileLevel = suggestion.is_file_level === true || suggestion.line_start === null ? 1 : 0;
-      const side = suggestion.old_or_new === 'OLD' ? 'LEFT' : 'RIGHT';
-
-      await dbRun(this.db, `
-        INSERT INTO comments (
-          review_id, source, author, ai_run_id, ai_level, ai_confidence,
-          file, line_start, line_end, side, type, title, body, suggestion_text, reasoning, status, is_file_level,
-          voice_id, is_raw
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `, [
-        reviewId,
-        'ai',
-        'AI Assistant',
-        runId,
-        suggestion.level || null, // ai_level
-        suggestion.confidence,
-        suggestion.file,
-        suggestion.line_start,
-        suggestion.line_end,
-        side,
-        suggestion.type,
-        suggestion.title,
-        body,
-        suggestionText,
-        suggestion.reasoning ? JSON.stringify(suggestion.reasoning) : null,
-        'active',
-        isFileLevel,
-        suggestion.voice_id || null,
-        suggestion.is_raw || 0
-      ]);
-    }
-
-    if (filteredCount > 0) {
-      logger.warn(`[Council] Filtered ${filteredCount} raw suggestions with invalid file paths`);
-    }
-    logger.info(`[Council] Stored ${suggestions.length - filteredCount} raw reviewer suggestions`);
+    });
+    logger.info(`[Council] Stored ${stored.suggestions.length} raw reviewer suggestions`);
   }
 
   /**

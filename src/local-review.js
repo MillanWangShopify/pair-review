@@ -21,6 +21,8 @@ const summaryGenerator = require('./ai/summary-generator');
 const tourGenerator = require('./ai/tour-generator');
 const { getShaAbbrevLength } = require('./git/sha-abbrev');
 const { GIT_DIFF_FLAGS, GIT_DIFF_FLAGS_ARRAY } = require('./git/diff-flags');
+const { splitGitPathLines, quoteGitPath } = require('./utils/git-paths');
+const { findMergeBase } = require('./git/scoped-changed-files');
 // Namespace import (not destructured) so detectBaseBranch is resolved off the
 // module object at call time — this keeps it interceptable by vi.spyOn on the
 // base-branch module in tests, unlike a destructured binding captured at load.
@@ -298,7 +300,7 @@ async function getUntrackedFiles(repoPath) {
       stdio: ['pipe', 'pipe', 'pipe']
     });
 
-    const files = output.trim().split('\n').filter(f => f.length > 0);
+    const files = splitGitPathLines(output);
 
     // Process files in parallel for better performance
     // Use Promise.allSettled to process all files even if some fail
@@ -376,29 +378,6 @@ async function getUntrackedFiles(repoPath) {
 }
 
 /**
- * Find merge-base between baseBranch and HEAD using local refs.
- * This is only used in local review mode where the local ref is authoritative.
- * @param {string} repoPath - Path to the git repository
- * @param {string} baseBranch - Base branch name
- * @returns {Promise<string>} Merge-base SHA
- */
-async function findMergeBase(repoPath, baseBranch) {
-  if (!baseBranch || !/^[\w.\-\/]+$/.test(baseBranch)) {
-    throw new Error(`Invalid branch name: ${baseBranch}`);
-  }
-
-  try {
-    return execSync(`git merge-base ${baseBranch} HEAD`, {
-      cwd: repoPath,
-      encoding: 'utf8',
-      stdio: ['pipe', 'pipe', 'pipe']
-    }).trim();
-  } catch (error) {
-    throw new Error(`Could not find merge-base between ${baseBranch} and HEAD: ${error.message}`);
-  }
-}
-
-/**
  * Generate diff output for untracked files using git diff --no-index.
  * @param {string} repoPath - Path to the git repository
  * @param {Array} untrackedFiles - Array from getUntrackedFiles()
@@ -447,9 +426,15 @@ function generateUntrackedDiffs(repoPath, untrackedFiles, options = {}) {
         }
 
         if (fileDiff && fileDiff.trim()) {
+          // Replace git's absolute --no-index paths with the repo-relative
+          // path, spelled (C-quoted when needed) exactly as git spells tracked
+          // files. Git quotes these headers too, so match either spelling;
+          // function replacers keep `$` in filenames literal.
+          const oldHeaderPath = quoteGitPath(`a/${untracked.file}`);
+          const newHeaderPath = quoteGitPath(`b/${untracked.file}`);
           const normalizedDiff = fileDiff
-            .replace(/^diff --git a\/.+? b\/.+$/m, `diff --git a/${untracked.file} b/${untracked.file}`)
-            .replace(/^\+\+\+ b\/.+$/m, `+++ b/${untracked.file}`);
+            .replace(/^diff --git .+$/m, () => `diff --git ${oldHeaderPath} ${newHeaderPath}`)
+            .replace(/^\+\+\+ .+$/m, () => `+++ ${newHeaderPath}`);
 
           if (diff) {
             diff += '\n';
@@ -642,7 +627,7 @@ async function computeScopedDigest(repoPath, scopeStart, scopeEnd) {
       const result = await execAsync('git ls-files --others --exclude-standard', {
         cwd: repoPath, encoding: 'utf8'
       });
-      const files = result.stdout.trim().split('\n').filter(f => f.length > 0);
+      const files = splitGitPathLines(result.stdout);
       let untrackedInfo = '';
       for (const file of files) {
         try {

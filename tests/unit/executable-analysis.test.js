@@ -325,6 +325,30 @@ describe('getChangedFiles', () => {
       expect(cmd).toContain('abc...def');
       expect(cmd).toContain('--name-only');
     });
+
+    it('decodes git-quoted names so they match the decoded diff headers', async () => {
+      mockExecForCalls({ '...': String.raw`"caf\303\251.js"` + '\nplain.js\n' });
+
+      const files = await getChangedFiles('/repo', { baseSha: 'abc', headSha: 'def' });
+
+      expect(files).toEqual(['café.js', 'plain.js']);
+    });
+  });
+
+  describe('local mode path decoding', () => {
+    it('decodes quoted tracked and untracked names and dedupes across scope stops', async () => {
+      mockExec.mockImplementation((cmd, opts, cb) => {
+        const callback = typeof opts === 'function' ? opts : cb;
+        const stdout = cmd.includes('ls-files')
+          ? String.raw`"\303\274nt.js"` + '\n'
+          : String.raw`"caf\303\251.js"` + '\n"tab\\tname.js"\n';
+        process.nextTick(() => callback(null, { stdout, stderr: '' }));
+      });
+
+      const files = await getChangedFiles('/repo', { scopeStart: 'staged', scopeEnd: 'untracked' });
+
+      expect(files).toEqual(['café.js', 'tab\tname.js', 'ünt.js']);
+    });
   });
 
   // ── Local mode: scope-aware ────────────────────────────────────

@@ -6,7 +6,8 @@ const os = require('os');
 const { getConfigDir, DEFAULT_CHECKOUT_TIMEOUT_MS } = require('../config');
 const { WorktreeRepository, generateWorktreeId } = require('../database');
 const { getGeneratedFilePatterns } = require('./gitattributes');
-const { normalizeRepository, resolveRenamedFile, resolveRenamedFileOld } = require('../utils/paths');
+const { normalizeRepository } = require('../utils/paths');
+const { buildChangedFileEntries } = require('./changed-file-entries');
 const { GIT_DIFF_FLAGS_ARRAY, GIT_DIFF_SUMMARY_FLAGS_ARRAY } = require('./diff-flags');
 const { rawFetchNoTags, fetchWithPruneRecovery } = require('./fetch-helpers');
 const { spawn, execSync } = require('child_process');
@@ -897,23 +898,7 @@ class GitWorktreeManager {
       // Parse .gitattributes to identify generated files
       const gitattributes = await getGeneratedFilePatterns(worktreePath);
 
-      return diffSummary.files.map(file => {
-        const resolvedFile = resolveRenamedFile(file.file);
-        const isRenamed = resolvedFile !== file.file;
-        const result = {
-          file: resolvedFile,
-          insertions: file.insertions,
-          deletions: file.deletions,
-          changes: file.changes,
-          binary: file.binary || false,
-          generated: gitattributes.isGenerated(resolvedFile)
-        };
-        if (isRenamed) {
-          result.renamed = true;
-          result.renamedFrom = resolveRenamedFileOld(file.file);
-        }
-        return result;
-      });
+      return buildChangedFileEntries(diffSummary.files, gitattributes);
 
     } catch (error) {
       console.error('Error getting changed files:', error);

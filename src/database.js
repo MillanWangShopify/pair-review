@@ -6125,6 +6125,16 @@ class ContextFileRepository {
     `, [result.lastID]);
   }
 
+  /** Seed a suggestion's file once, even when analysis voices save concurrently. */
+  async addIfFileMissing(reviewId, file, lineStart, lineEnd, label = null) {
+    const result = await run(this.db, `
+      INSERT INTO context_files (review_id, file, line_start, line_end, label)
+      SELECT ?, ?, ?, ?, ?
+      WHERE NOT EXISTS (SELECT 1 FROM context_files WHERE review_id = ? AND file = ?)
+    `, [reviewId, file, lineStart, lineEnd, label, reviewId, file]);
+    return result.changes > 0 ? { id: result.lastID } : null;
+  }
+
   /**
    * Get all context file ranges for a review, ordered by id
    * @param {number} reviewId - Review ID

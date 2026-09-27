@@ -4068,8 +4068,10 @@ class ChatPanel {
     if (!reviewId || !file || !lineStart) return null;
 
     try {
+      // Context files are outside the diff: read the working tree, as the
+      // context-file render does (PR mode ignores the flag).
       const resp = await fetch(
-        `/api/reviews/${reviewId}/file-content/${encodeURIComponent(file)}`
+        `/api/reviews/${reviewId}/file-content/${encodeURIComponent(file)}?source=worktree`
       );
       if (!resp || !resp.ok) {
         console.warn(

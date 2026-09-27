@@ -796,6 +796,10 @@ pair-review's AI analysis system examines your code changes at increasing levels
 
 This progressive approach keeps analysis focused while catching issues at every scope.
 
+Findings can also reference unchanged files. These files are automatically added as context files for the final analysis results, or when you select a council voice, with the suggested lines exposed in the review. Rendering suggestions reveals their ranges in place without adding context files. Dismissing a finding keeps its context file; use the file's **X** button to remove it. A removed panel returns when a later final analysis reports a finding in that file, when you select a voice with a finding there or whenever the suggestions reload while that voice is selected (for example after a refresh, a whitespace toggle, or a scope change), or when you click a finding or comment in that file.
+
+When submitting a GitHub review, comments on unchanged files stay active in pair-review. The submission notice lists these retained comments; headless submissions log each skipped finding.
+
 ### Analysis Configuration
 
 There are three ways to configure which models run your analysis, each building on the last:

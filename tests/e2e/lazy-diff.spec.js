@@ -273,6 +273,85 @@ test.describe('Lazy / budgeted diff rendering (PR mode)', () => {
     await expect.poll(() => pierreShadowLineCount(page, COLLAPSED_FILE)).toBeGreaterThan(0);
   });
 
+  test('manual Load diff and concurrent suggestion rendering both complete', async ({ page }) => {
+    await mockLargeMainDiff(page);
+    await mockUserComments(page, []);
+    const suggestions = [];
+    await mockSuggestions(page, suggestions);
+    await page.goto(PR_PATH);
+    await waitForDiffToRender(page);
+    await page.waitForFunction(() => !!window.prManager?.analysisHistoryManager);
+    await page.evaluate(() => window.prManager.loadAISuggestions());
+
+    const wrapper = page.locator(`.d2h-file-wrapper[data-file-name="${COLLAPSED_FILE}"]`);
+    await expect(wrapper.locator('.large-diff-placeholder')).toBeVisible();
+    suggestions.push({
+      id: 9050, file: COLLAPSED_FILE, line_start: 12, line_end: 12,
+      side: 'RIGHT', source: 'ai', status: 'active', is_file_level: 0,
+      type: 'bug', title: 'Concurrent deferred finding', body: 'Keep this finding visible.'
+    });
+
+    await page.evaluate(file => {
+      const manager = window.prManager;
+      const originalYield = manager._yieldForDiffWork;
+      const originalMaterialize = manager._materializeDeferredDiff;
+      let release;
+      const paused = new Promise(resolve => { release = resolve; });
+      const gate = window.deferredFeedbackGate = {
+        release, manualFinished: false, suggestionsFinished: false, error: null,
+        restore: () => {
+          manager._yieldForDiffWork = originalYield;
+          manager._materializeDeferredDiff = originalMaterialize;
+        }
+      };
+      let manualStarting = false;
+      manager._yieldForDiffWork = function(signal) {
+        if (manualStarting) {
+          gate.manualPaused = true;
+          return paused;
+        }
+        return originalYield.call(this, signal);
+      };
+      manager._materializeDeferredDiff = function(path, options = {}) {
+        manualStarting = path === file && options.reanchor === true;
+        const pending = originalMaterialize.call(this, path, options);
+        if (manualStarting) {
+          pending.then(() => { gate.manualFinished = true; }, error => { gate.error = error.message; });
+        } else if (path === file && gate.manualPaused) {
+          gate.suggestionWaiting = true;
+        }
+        manualStarting = false;
+        return pending;
+      };
+    }, COLLAPSED_FILE);
+
+    try {
+      await wrapper.getByRole('button', { name: 'Load diff', exact: true }).click();
+      await page.waitForFunction(() => window.deferredFeedbackGate.manualPaused);
+      await page.evaluate(items => {
+        window.prManager.suggestionManager.displayAISuggestions(items).then(
+          () => { window.deferredFeedbackGate.suggestionsFinished = true; },
+          error => { window.deferredFeedbackGate.error = error.message; }
+        );
+      }, suggestions);
+      await page.waitForFunction(() => window.deferredFeedbackGate.suggestionWaiting);
+      expect(await page.evaluate(() => window.deferredFeedbackGate.manualFinished)).toBe(false);
+      await page.evaluate(() => window.deferredFeedbackGate.release());
+      await page.waitForFunction(() => {
+        const gate = window.deferredFeedbackGate;
+        return gate.error || (gate.manualFinished && gate.suggestionsFinished);
+      });
+      expect(await page.evaluate(() => window.deferredFeedbackGate.error)).toBeNull();
+      await expect(wrapper.locator('.ai-suggestion[data-suggestion-id="9050"]')).toBeVisible();
+      await expect(wrapper.locator('.large-diff-placeholder')).toHaveCount(0);
+    } finally {
+      await page.evaluate(() => {
+        window.deferredFeedbackGate.release();
+        window.deferredFeedbackGate.restore();
+      });
+    }
+  });
+
   // ── Scenario 3: overlay on a deferred diff force-materializes + anchors ────
   test('user comment on a deferred large diff force-materializes the body and anchors', async ({ page }) => {
     await mockLargeMainDiff(page);

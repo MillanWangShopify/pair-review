@@ -15,7 +15,7 @@
  */
 
 const express = require('express');
-const { queryOne, withTransaction, ReviewRepository, CommentRepository, AnalysisRunRepository, CouncilRepository } = require('../database');
+const { queryOne, withTransaction, ReviewRepository, AnalysisRunRepository, CouncilRepository } = require('../database');
 const Analyzer = require('../ai/analyzer');
 const { getTierForModel } = require('../ai/provider');
 const { v4: uuidv4 } = require('uuid');
@@ -36,6 +36,8 @@ const {
 } = require('./shared');
 const { generateScopedDiff, computeScopedDigest, getCurrentBranch } = require('../local-review');
 const { reviewScope } = require('../local-scope');
+const { getSuggestionDiffFiles, validateAndFilterSuggestions, storeReviewSuggestions } = require('../utils/suggestion-storage');
+const { resolveRepoRoot } = require('../utils/review-paths');
 const { validateCouncilConfig, normalizeCouncilConfig } = require('./councils');
 const { TIERS, TIER_ALIASES, VALID_TIERS, resolveTier } = require('../ai/prompts/config');
 
@@ -283,10 +285,15 @@ router.post('/api/analyses/results', async (req, res) => {
       ...suggestions.map(s => ({ ...s, is_file_level: false })),
       ...fileLevelSuggestions.map(s => ({ ...s, is_file_level: true }))
     ];
-    const totalSuggestions = allSuggestions.length;
-    const filesAnalyzed = new Set(allSuggestions.map(s => s.file)).size;
-
-    const commentRepo = new CommentRepository(db);
+    let totalSuggestions = 0;
+    let contextFilesChanged = false;
+    // Resolve the review's scoped diff before opening a transaction: the fallback
+    // may run git, which must not hold the shared SQLite connection across I/O.
+    const review = await queryOne(db, 'SELECT * FROM reviews WHERE id = ?', [reviewId]);
+    const changedFiles = await getSuggestionDiffFiles(db, review);
+    const preparedSuggestions = await validateAndFilterSuggestions(
+      allSuggestions, changedFiles, new Map(), await resolveRepoRoot(db, review)
+    );
 
     await withTransaction(db, async () => {
       await analysisRunRepo.create({
@@ -299,7 +306,12 @@ router.post('/api/analyses/results', async (req, res) => {
         status: 'completed'
       });
 
-      await commentRepo.bulkInsertAISuggestions(reviewId, runId, allSuggestions);
+      const stored = await storeReviewSuggestions(db, {
+        reviewId, runId, suggestions: allSuggestions, changedFiles, preparedSuggestions, broadcast: false
+      });
+      totalSuggestions = stored.suggestions.length;
+      contextFilesChanged = stored.contextFilesChanged;
+      const filesAnalyzed = new Set(stored.suggestions.map(s => s.file)).size;
 
       await analysisRunRepo.update(runId, {
         summary,
@@ -309,6 +321,9 @@ router.post('/api/analyses/results', async (req, res) => {
     });
 
     // --- Broadcast completion event via WebSocket (after transaction completes) ---
+    if (contextFilesChanged) {
+      broadcastReviewEvent(reviewId, { type: 'review:context_files_changed' });
+    }
     broadcastReviewEvent(reviewId, { type: 'review:analysis_completed' });
 
     logger.success(`Imported ${totalSuggestions} external analysis suggestions (run ${runId})`);

@@ -573,4 +573,34 @@ describe('GitWorktreeManager base SHA availability', () => {
     ]);
     expect(result[0].file).toBe(longPath);
   });
+
+  it('decodes git-quoted numstat paths and rename syntax into diff-header spelling', async () => {
+    const worktreeGit = createMockGit({
+      diffSummary: vi.fn().mockResolvedValue({
+        files: [
+          { file: String.raw`"caf\303\251.js"`, insertions: 1, deletions: 0, changes: 1, binary: false },
+          { file: String.raw`dir/moved.js => "dir/m\303\266v\303\251d.js"`, insertions: 0, deletions: 0, changes: 0, binary: false },
+          { file: 'src/{old.js => new.js}', insertions: 0, deletions: 0, changes: 0, binary: false },
+          { file: 'src/plain.js => top.js', insertions: 0, deletions: 0, changes: 0, binary: false },
+          { file: 'plain.js', insertions: 2, deletions: 1, changes: 3, binary: false }
+        ]
+      })
+    });
+
+    manager._gitFor = vi.fn().mockReturnValue(worktreeGit);
+    manager.assertCommitAvailableLocally = vi.fn().mockResolvedValue(undefined);
+
+    const result = await manager.getChangedFiles('/tmp/worktrees/existing', {
+      base_sha: 'base-sha',
+      head_sha: 'head-sha'
+    });
+
+    expect(result.map(({ file, renamed, renamedFrom }) => ({ file, renamed, renamedFrom }))).toEqual([
+      { file: 'café.js', renamed: undefined, renamedFrom: undefined },
+      { file: 'dir/mövéd.js', renamed: true, renamedFrom: 'dir/moved.js' },
+      { file: 'src/new.js', renamed: true, renamedFrom: 'src/old.js' },
+      { file: 'top.js', renamed: true, renamedFrom: 'src/plain.js' },
+      { file: 'plain.js', renamed: undefined, renamedFrom: undefined }
+    ]);
+  });
 });

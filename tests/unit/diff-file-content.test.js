@@ -7,21 +7,17 @@ const {
   resolveOriginalFileContentSpecs,
   resolveOriginalFileContentSpec
 } = require('../../src/utils/diff-file-content');
+// Shared with the browser parser's test (tests/unit/frontend-git-paths.test.js).
+const { DIFF_HEADER_CASES, MALFORMED_DIFF_HEADERS } = require('../utils/git-path-fixtures');
 
 describe('diff-file-content', () => {
   describe('parseDiffGitPaths', () => {
-    it('parses plain diff headers', () => {
-      expect(parseDiffGitPaths('diff --git a/src/file.js b/src/file.js')).toEqual({
-        oldPath: 'src/file.js',
-        newPath: 'src/file.js'
-      });
+    it.each(DIFF_HEADER_CASES)('decodes Git paths in %s', (header, oldPath, newPath) => {
+      expect(parseDiffGitPaths(header)).toEqual({ oldPath, newPath });
     });
 
-    it('parses quoted diff headers', () => {
-      expect(parseDiffGitPaths('diff --git "a/src/file name.js" "b/src/file name.js"')).toEqual({
-        oldPath: 'src/file name.js',
-        newPath: 'src/file name.js'
-      });
+    it.each(MALFORMED_DIFF_HEADERS)('rejects malformed headers: %s', header => {
+      expect(parseDiffGitPaths(header)).toBeNull();
     });
   });
 

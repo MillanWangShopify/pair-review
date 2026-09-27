@@ -570,6 +570,72 @@ describe('PR Management Endpoints', () => {
       expect(response.body.stats.deletions).toBe(5);
     });
 
+    it('should decode non-ASCII paths and full renames when regenerating with ?w=1', async () => {
+      const repoDir = fs.mkdtempSync(nodePath.join(os.tmpdir(), 'pair-review-ws-regen-'));
+      const { execFileSync } = require('child_process');
+      const git = (...args) => execFileSync('git', args, { cwd: repoDir, encoding: 'utf8', stdio: 'pipe' });
+      try {
+        git('init', '-b', 'main');
+        git('config', 'user.email', 'test@test.com');
+        git('config', 'user.name', 'Test User');
+        git('config', 'core.quotePath', 'true');
+        fs.writeFileSync(nodePath.join(repoDir, 'café.js'), 'one\ntwo\n');
+        fs.mkdirSync(nodePath.join(repoDir, 'lib'));
+        fs.writeFileSync(nodePath.join(repoDir, 'lib', 'moved.js'), 'a\nb\nc\nd\ne\n');
+        fs.writeFileSync(nodePath.join(repoDir, 'image.png'), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0x01]));
+        git('add', '.');
+        git('commit', '-m', 'base');
+        const baseSha = git('rev-parse', 'HEAD').trim();
+
+        fs.writeFileSync(nodePath.join(repoDir, 'café.js'), 'one\ntwo\nthree\n');
+        fs.mkdirSync(nodePath.join(repoDir, 'other'));
+        git('mv', 'lib/moved.js', 'other/renamed.js');
+        fs.writeFileSync(nodePath.join(repoDir, 'image.png'), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0x02]));
+        git('add', '-A');
+        git('commit', '-m', 'head');
+        const headSha = git('rev-parse', 'HEAD').trim();
+
+        // Sanity: git itself prints the quoted spelling this test exists for.
+        expect(git('diff', '--numstat', `${baseSha}...${headSha}`)).toContain('"caf\\303\\251.js"');
+
+        const prData = JSON.stringify({
+          state: 'open',
+          diff: '',
+          changed_files: [],
+          additions: 0,
+          deletions: 0,
+          html_url: 'https://github.com/owner/repo/pull/1',
+          base_sha: baseSha,
+          head_sha: headSha,
+          node_id: 'PR_node123'
+        });
+        await run(db, `
+          INSERT INTO pr_metadata (pr_number, repository, title, description, author, base_branch, head_branch, pr_data)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `, [1, 'owner/repo', 'Test PR', 'Desc', 'testuser', 'main', 'feature', prData]);
+        const now = new Date().toISOString();
+        await run(db, `
+          INSERT INTO worktrees (id, pr_number, repository, branch, path, created_at, last_accessed_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?)
+        `, ['ws-regen', 1, 'owner/repo', 'feature-branch', repoDir, now, now]);
+
+        const response = await request(server).get('/api/pr/owner/repo/1/diff?w=1');
+
+        expect(response.status).toBe(200);
+        expect(response.body.diff).toContain('diff --git "a/caf\\303\\251.js" "b/caf\\303\\251.js"');
+        const files = response.body.changed_files.map(({ file, renamed, renamedFrom, binary }) =>
+          ({ file, renamed: renamed || false, renamedFrom: renamedFrom || null, binary }));
+        expect(files).toHaveLength(3);
+        expect(files).toEqual(expect.arrayContaining([
+          { file: 'café.js', renamed: false, renamedFrom: null, binary: false },
+          { file: 'other/renamed.js', renamed: true, renamedFrom: 'lib/moved.js', binary: false },
+          { file: 'image.png', renamed: false, renamedFrom: null, binary: true }
+        ]));
+      } finally {
+        fs.rmSync(repoDir, { recursive: true, force: true });
+      }
+    });
+
     it('should recover full long file paths from diff headers when cached changed_files are abbreviated', async () => {
       const longPath = 'areas/internal-services/meteorite/ui/app/frontend/src/routes/repos/$owner/$repo/pulls/$number/route.tsx';
       const prData = JSON.stringify({
@@ -579,7 +645,7 @@ describe('PR Management Endpoints', () => {
           'index 1111111..2222222 100644',
           `--- a/${longPath}`,
           `+++ b/${longPath}`,
-          '@@ -1 +1,2 @@',
+          '@@ -1 +1,3 @@',
           ' export const Route = {};',
           '+Route.component = View;',
           '+Route.loader = loader;'
@@ -2904,6 +2970,165 @@ describe('Review Submission Endpoint', () => {
   });
 
   describe('POST /api/pr/:owner/:repo/:number/submit-review', () => {
+    it.each(['COMMENT', 'DRAFT'])('retains outside-diff comments locally when submitting %s', async event => {
+      const included = await run(db, `
+        INSERT INTO comments (review_id, source, file, line_start, side, body, status)
+        VALUES (?, 'user', 'file.js', 2, 'LEFT', 'Changed file comment', 'active')
+      `, [prId]);
+      const skipped = await run(db, `
+        INSERT INTO comments (review_id, source, file, line_start, line_end, body, status)
+        VALUES (?, 'user', 'unchanged.js', 10, 12, 'Keep this local', 'active')
+      `, [prId]);
+
+      const response = await request(server).post('/api/pr/owner/repo/1/submit-review')
+        .send({ event, body: 'Review summary' });
+
+      expect(response.status).toBe(200);
+      const submit = event === 'DRAFT' ? GitHubClient.prototype.createDraftReviewGraphQL : GitHubClient.prototype.createReviewGraphQL;
+      const payload = submit.mock.calls[0][event === 'DRAFT' ? 2 : 3];
+      expect(payload).toHaveLength(1);
+      expect(payload[0]).toMatchObject({ path: 'file.js', side: 'LEFT' });
+      expect(response.body.skipped_comments).toEqual([expect.objectContaining({
+        id: skipped.lastID, file: 'unchanged.js', line_start: 10, line_end: 12,
+        body: 'Keep this local', reason: 'outside_diff'
+      })]);
+      expect(await query(db, 'SELECT id, status FROM comments ORDER BY id')).toEqual([
+        { id: included.lastID, status: event === 'DRAFT' ? 'draft' : 'submitted' },
+        { id: skipped.lastID, status: 'active' }
+      ]);
+    });
+
+    it('submits the review body when all comments are on unchanged files', async () => {
+      const skipped = await run(db, `
+        INSERT INTO comments (review_id, source, file, body, status, is_file_level)
+        VALUES (?, 'user', 'unchanged.js', 'File comment kept locally', 'active', 1)
+      `, [prId]);
+      const response = await request(server).post('/api/pr/owner/repo/1/submit-review')
+        .send({ event: 'COMMENT', body: 'Body-only review' });
+
+      expect(response.status).toBe(200);
+      expect(GitHubClient.prototype.createReviewGraphQL.mock.calls[0].slice(1, 4))
+        .toEqual(['COMMENT', 'Body-only review', []]);
+      expect(response.body.skipped_comments).toEqual([expect.objectContaining({ id: skipped.lastID, is_file_level: 1 })]);
+      expect((await query(db, 'SELECT status FROM comments WHERE id = ?', [skipped.lastID]))[0].status).toBe('active');
+    });
+
+    it('returns retained comments without creating an empty GitHub review', async () => {
+      const skipped = await run(db, `
+        INSERT INTO comments (review_id, source, file, body, status, is_file_level)
+        VALUES (?, 'user', 'unchanged.js', 'Keep this local', 'active', 1)
+      `, [prId]);
+      const response = await request(server).post('/api/pr/owner/repo/1/submit-review')
+        .send({ event: 'COMMENT', body: '   ' });
+      expect(response.status).toBe(400);
+      expect(response.body.skippedComments).toEqual([expect.objectContaining({ id: skipped.lastID })]);
+      expect(GitHubClient.prototype.createReviewGraphQL).not.toHaveBeenCalled();
+      expect((await query(db, 'SELECT status FROM comments WHERE id = ?', [skipped.lastID]))[0].status).toBe('active');
+    });
+
+    it('submits a comment on a git-quoted non-ASCII file as a line comment', async () => {
+      GitWorktreeManager.prototype.generateUnifiedDiff.mockResolvedValue([
+        String.raw`diff --git "a/caf\303\251.js" "b/caf\303\251.js"`,
+        'index 1111111..2222222 100644',
+        String.raw`--- "a/caf\303\251.js"`,
+        String.raw`+++ "b/caf\303\251.js"`,
+        '@@ -1,2 +1,3 @@',
+        ' line1',
+        '+added',
+        ' line2'
+      ].join('\n'));
+      await run(db, `UPDATE pr_metadata SET pr_data = json_set(pr_data, '$.changed_files', json(?))`,
+        [JSON.stringify([{ file: 'café.js', insertions: 1, deletions: 0, changes: 1 }])]);
+      await run(db, `
+        INSERT INTO comments (review_id, source, file, line_start, side, body, status)
+        VALUES (?, 'user', 'café.js', 2, 'RIGHT', 'Inline on a quoted path', 'active')
+      `, [prId]);
+
+      const response = await request(server).post('/api/pr/owner/repo/1/submit-review')
+        .send({ event: 'COMMENT', body: 'Review summary' });
+
+      expect(response.status).toBe(200);
+      expect(GitHubClient.prototype.createReviewGraphQL.mock.calls[0][3]).toEqual([{
+        path: 'café.js', line: 2, side: 'RIGHT', body: 'Inline on a quoted path', isFileLevel: false
+      }]);
+    });
+
+    it('rejects a bodyless REQUEST_CHANGES whose only comments are on unchanged files', async () => {
+      const skipped = await run(db, `
+        INSERT INTO comments (review_id, source, file, line_start, body, status)
+        VALUES (?, 'user', 'unchanged.js', 4, 'Keep this local', 'active')
+      `, [prId]);
+      const response = await request(server).post('/api/pr/owner/repo/1/submit-review')
+        .send({ event: 'REQUEST_CHANGES' });
+      expect(response.status).toBe(400);
+      expect(response.body.skippedComments).toEqual([expect.objectContaining({ id: skipped.lastID })]);
+      expect(GitHubClient.prototype.createReviewGraphQL).not.toHaveBeenCalled();
+    });
+
+    it('submits a bodyless APPROVE with no comments', async () => {
+      const response = await request(server).post('/api/pr/owner/repo/1/submit-review')
+        .send({ event: 'APPROVE' });
+
+      expect(response.status).toBe(200);
+      expect(GitHubClient.prototype.createReviewGraphQL.mock.calls[0].slice(1, 4))
+        .toEqual(['APPROVE', '', []]);
+      expect(response.body.skipped_comments).toEqual([]);
+    });
+
+    it('submits a bodyless APPROVE whose only comments are on unchanged files', async () => {
+      const skipped = await run(db, `
+        INSERT INTO comments (review_id, source, file, line_start, body, status)
+        VALUES (?, 'user', 'unchanged.js', 7, 'Keep this local', 'active')
+      `, [prId]);
+      const response = await request(server).post('/api/pr/owner/repo/1/submit-review')
+        .send({ event: 'APPROVE', body: '' });
+
+      expect(response.status).toBe(200);
+      expect(GitHubClient.prototype.createReviewGraphQL.mock.calls[0].slice(1, 4))
+        .toEqual(['APPROVE', '', []]);
+      expect(response.body.skipped_comments).toEqual([expect.objectContaining({
+        id: skipped.lastID, file: 'unchanged.js', line_start: 7, reason: 'outside_diff'
+      })]);
+      expect((await query(db, 'SELECT status FROM comments WHERE id = ?', [skipped.lastID]))[0].status).toBe('active');
+    });
+
+    it('creates a bodyless DRAFT whose only comments are on unchanged files', async () => {
+      const skipped = await run(db, `
+        INSERT INTO comments (review_id, source, file, line_start, body, status)
+        VALUES (?, 'user', 'unchanged.js', 3, 'Keep this local', 'active')
+      `, [prId]);
+      const response = await request(server).post('/api/pr/owner/repo/1/submit-review')
+        .send({ event: 'DRAFT' });
+
+      expect(response.status).toBe(200);
+      expect(GitHubClient.prototype.createDraftReviewGraphQL.mock.calls[0].slice(1, 3))
+        .toEqual(['', []]);
+      expect(response.body.skipped_comments).toEqual([expect.objectContaining({ id: skipped.lastID })]);
+      expect((await query(db, 'SELECT status FROM comments WHERE id = ?', [skipped.lastID]))[0].status).toBe('active');
+    });
+
+    it('fails closed when changed files cannot be determined for active comments', async () => {
+      await run(db, `UPDATE pr_metadata SET pr_data = json_set(pr_data, '$.diff', '', '$.changed_files', json('[]'))`);
+      GitWorktreeManager.prototype.generateUnifiedDiff.mockResolvedValue('');
+      await run(db, `INSERT INTO comments (review_id, source, file, body, status)
+        VALUES (?, 'user', 'file.js', 'Review this', 'active')`, [prId]);
+      const response = await request(server).post('/api/pr/owner/repo/1/submit-review')
+        .send({ event: 'COMMENT', body: 'Review summary' });
+      expect(response.status).toBe(400);
+      expect(response.body.error).toContain('Could not determine');
+      expect(GitHubClient.prototype.createReviewGraphQL).not.toHaveBeenCalled();
+    });
+
+    it('allows a body-only review when changed files are unknown', async () => {
+      await run(db, `UPDATE pr_metadata SET pr_data = json_set(pr_data, '$.diff', '', '$.changed_files', json('[]'))`);
+      GitWorktreeManager.prototype.generateUnifiedDiff.mockResolvedValue('');
+      const response = await request(server).post('/api/pr/owner/repo/1/submit-review')
+        .send({ event: 'COMMENT', body: 'Review summary' });
+      expect(response.status).toBe(200);
+      expect(GitHubClient.prototype.createReviewGraphQL.mock.calls[0].slice(1, 4))
+        .toEqual(['COMMENT', 'Review summary', []]);
+    });
+
     it('should return 400 for invalid PR number', async () => {
       const response = await request(server)
         .post('/api/pr/owner/repo/invalid/submit-review')
@@ -3010,6 +3235,9 @@ describe('Review Submission Endpoint', () => {
     });
 
     it('should submit mixed file-level and line-level comments correctly', async () => {
+      const metadata = await queryOne(db, 'SELECT pr_data FROM pr_metadata WHERE pr_number = 1');
+      await run(db, 'UPDATE pr_metadata SET pr_data = ? WHERE pr_number = 1',
+        [JSON.stringify({ ...JSON.parse(metadata.pr_data), changed_files: ['file.js', 'file1.js'] })]);
       // Insert a file-level comment
       await run(db, `
         INSERT INTO comments (review_id, source, file, body, status, is_file_level)
@@ -3321,6 +3549,9 @@ describe('Review Submission Endpoint', () => {
     });
 
     it('should NOT delete comments or analysis_runs when submitting review (regression test for cascade deletion bug)', async () => {
+      const metadata = await queryOne(db, 'SELECT pr_data FROM pr_metadata WHERE pr_number = 1');
+      await run(db, 'UPDATE pr_metadata SET pr_data = ? WHERE pr_number = 1',
+        [JSON.stringify({ ...JSON.parse(metadata.pr_data), changed_files: ['file1.js', 'file2.js'] })]);
       // This test verifies the fix for a critical bug where INSERT OR REPLACE
       // on the reviews table caused cascade deletion of all related comments
       // and analysis_runs due to foreign key ON DELETE CASCADE constraints.
@@ -5402,6 +5633,27 @@ describe('Local Review Diff Generated Files', () => {
       expect(response.body.diff).toBeTruthy();
     });
 
+    it('should report generated files with git-quoted names in decoded spelling', async () => {
+      localReviewDiffs.set(reviewId, {
+        diff: [
+          String.raw`diff --git "a/gen/caf\303\251.lock" "b/gen/caf\303\251.lock"`,
+          String.raw`--- "a/gen/caf\303\251.lock"`,
+          String.raw`+++ "b/gen/caf\303\251.lock"`,
+          '@@ -1 +1 @@',
+          '-old',
+          '+new'
+        ].join('\n'),
+        stats: { unstagedChanges: 1, untrackedFiles: 0 }
+      });
+      fs.writeFileSync(nodePath.join(tempDir, '.gitattributes'), 'gen/** linguist-generated=true\n');
+
+      const response = await request(server).get(`/api/local/${reviewId}/diff`);
+
+      expect(response.status).toBe(200);
+      expect(response.body.generated_files).toEqual(['gen/café.lock']);
+      expect(Object.keys(response.body.hunk_hashes_by_file)).toEqual(['gen/café.lock']);
+    });
+
     it('should return empty generated_files when no .gitattributes exists', async () => {
       localReviewDiffs.set(reviewId, {
         diff: sampleDiff,
@@ -5765,6 +6017,14 @@ describe('File Content Endpoints', () => {
   });
 
   describe('GET /api/file-content-original/:fileName (PR Mode)', () => {
+    let fsStatSpy;
+    beforeEach(() => {
+      // These endpoint tests use a mocked worktree path. The root resolver now
+      // checks that path before file reads, so model a present directory here.
+      fsStatSpy = vi.spyOn(fs, 'stat').mockResolvedValue({ isDirectory: () => true });
+    });
+    afterEach(() => fsStatSpy.mockRestore());
+
     it('should return file content from worktree for valid request', async () => {
       await insertTestPR(db, 1, 'owner/repo');
       await insertTestWorktree(db, 1, 'owner/repo');
@@ -7646,6 +7906,15 @@ describe('Context Files Endpoints', () => {
       expect(response.body.error).toContain('already part of the diff');
     });
 
+    it('should return 400 for a diff file spelled with a ./ prefix', async () => {
+      const response = await request(server)
+        .post(`/api/reviews/${reviewId}/context-files`)
+        .send({ file: './src/existing-diff-file.js', line_start: 1, line_end: 10 });
+
+      expect(response.status).toBe(400);
+      expect(response.body.error).toContain('already part of the diff');
+    });
+
     it('should allow files not in the diff', async () => {
       const response = await request(server)
         .post(`/api/reviews/${reviewId}/context-files`)
@@ -7966,6 +8235,40 @@ describe('Share Endpoint', () => {
         additions: 1,
         deletions: 0
       });
+    });
+
+    it('spells changed-file paths like the diff for PRs cached before paths were decoded', async () => {
+      const diff = [
+        String.raw`diff --git "a/caf\303\251.js" "b/caf\303\251.js"`,
+        'index 1111111..2222222 100644',
+        String.raw`--- "a/caf\303\251.js"`,
+        String.raw`+++ "b/caf\303\251.js"`,
+        '@@ -1 +1,2 @@',
+        ' a',
+        '+b',
+        'diff --git a/missing.js b/missing.js',
+        'index 1111111..2222222 100644',
+        '--- a/missing.js',
+        '+++ b/missing.js',
+        '@@ -1 +1 @@',
+        '-x',
+        '+y',
+        ''
+      ].join('\n');
+      await run(db, `INSERT INTO pr_metadata (pr_number, repository, title, author, base_branch, head_branch, pr_data)
+        VALUES (1, 'owner/repo', 'Legacy PR', 'testuser', 'main', 'feature', ?)`, [JSON.stringify({
+        diff, base_sha: 'abc123', head_sha: 'def456',
+        // numstat's quoted spelling, as cached before the upgrade
+        changed_files: [{ file: String.raw`"caf\303\251.js"`, insertions: 1, deletions: 0 }]
+      })]);
+
+      const response = await request(server).get('/api/pr/owner/repo/1/share');
+
+      expect(response.status).toBe(200);
+      expect(response.body.changedFiles).toEqual([
+        { path: 'café.js', additions: 1, deletions: 0 },
+        { path: 'missing.js', additions: 1, deletions: 1 }
+      ]);
     });
 
     it('should return share payload with analysis run and suggestions', async () => {

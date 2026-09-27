@@ -1194,6 +1194,10 @@ class AIPanel {
         // else RIGHT. Deletions live on the LEFT, so a hardcoded RIGHT would
         // reveal the wrong line for deletion-side findings.
         const finding = this.findings?.find(f => String(f.id) === String(findingId));
+        if (file && window.prManager?.ensureContextPanelForJump) {
+            await window.prManager.ensureContextPanelForJump(file, finding?.line_start || Number(line) || null);
+            if (myGen !== this._navGen) return;
+        }
         const resolvedSide = side
             || finding?.side
             || 'RIGHT';
@@ -1299,6 +1303,10 @@ class AIPanel {
         // Resolve the diff side: explicit arg wins, else the comment's own side,
         // else RIGHT.
         const comment = this.comments?.find(c => String(c.id) === String(commentId));
+        if (file && window.prManager?.ensureContextPanelForJump) {
+            await window.prManager.ensureContextPanelForJump(file, comment?.line_start || Number(line) || null);
+            if (myGen !== this._navGen) return;
+        }
         const resolvedSide = side
             || comment?.side
             || 'RIGHT';

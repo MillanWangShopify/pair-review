@@ -18,11 +18,12 @@ const { ensureContextFileForComment } = require('../utils/auto-context');
 const path = require('path');
 const fs = require('fs').promises;
 const simpleGit = require('simple-git');
-const { GitWorktreeManager } = require('../git/worktree');
+const { resolveRepoRoot } = require('../utils/review-paths');
+const { seedContextFilesForSuggestions } = require('../utils/suggestion-storage');
 const { normalizeRepository } = require('../utils/paths');
 const { resolveFormat, formatAdoptedComment: formatComment } = require('../utils/comment-formatter');
 const { safeParseJson } = require('../utils/safe-parse-json');
-const { resolveOriginalFileContentSpecs } = require('../utils/diff-file-content');
+const { resolveOriginalFileContentSpecs, findFileBlobInfoInDiff } = require('../utils/diff-file-content');
 const validateReviewId = require('./middleware/validate-review-id');
 const { reviewScope, scopeIncludes, includesBranch } = require('../local-scope');
 const { findMergeBase } = require('../local-review');
@@ -44,15 +45,12 @@ async function resolveWorktreeForReview(review, db) {
   }
 
   const [owner, repo] = repository.split('/');
-  const worktreeManager = new GitWorktreeManager(db);
-
-  if (!await worktreeManager.worktreeExists({ owner, repo, number: prNumber })) {
+  const worktreePath = await resolveRepoRoot(db, review);
+  if (!worktreePath) {
     const err = new Error('Worktree not found for this PR. The PR may need to be reloaded.');
     err.statusCode = 404;
     throw err;
   }
-
-  const worktreePath = await worktreeManager.getWorktreePath({ owner, repo, number: prNumber });
 
   // Load cached PR metadata so callers can resolve exact diff blobs.
   const normalizedRepo = normalizeRepository(owner, repo);
@@ -619,6 +617,27 @@ router.get('/api/reviews/:reviewId/suggestions', validateReviewId, async (req, r
 
     res.json({ suggestions });
 
+    // Seed on every fetch of a council voice's run, not only when the voice
+    // is first picked. The browser re-requests these suggestions for other
+    // reasons too (context panel render, deferred render, Local whitespace
+    // toggle, refresh, scope change), and each one restores removed panels.
+    // That is deliberate: a finding must stay findable after its panel is
+    // closed, so closing a panel is not a lasting hide while a voice is
+    // selected.
+    if (runIdParam && !allRuns) {
+      try {
+        const selectedRun = await queryOne(db, 'SELECT parent_run_id FROM analysis_runs WHERE id = ? AND review_id = ?', [runIdParam, reviewId]);
+        if (selectedRun?.parent_run_id) {
+          const finalRows = rows.filter(row => row.ai_level == null);
+          if (finalRows.length > 0) {
+            await seedContextFilesForSuggestions(db, reviewId, finalRows, { validated: true });
+          }
+        }
+      } catch (error) {
+        logger.warn(`Could not seed context files for selected analysis ${runIdParam}: ${error.message}`);
+      }
+    }
+
   } catch (error) {
     logger.error('Error fetching AI suggestions:', error);
     res.status(500).json({
@@ -1007,8 +1026,17 @@ router.get('/api/reviews/:reviewId/file-content/:fileName(*)', validateReviewId,
 
       const localHeadSha = review.local_head_sha;
 
-      // Try git show for HEAD version (correct line numbers for diff)
-      if (localHeadSha) {
+      // The client says which version it wants. Context files (files outside
+      // the diff: user-pinned, auto-added for unchanged-file findings, chat
+      // snippets) pass ?source=worktree and get the working tree, which is
+      // what the AI read and what their findings are validated against; HEAD
+      // can differ, e.g. a staged-only file under the default unstaged scope.
+      // Diff files omit it and get HEAD, which supplies the diff's old-side
+      // line numbers for lazy bodies and gap expansion, falling back to the
+      // working tree when the file is not in HEAD (e.g. untracked).
+      const fromWorktree = req.query.source === 'worktree';
+
+      if (localHeadSha && !fromWorktree) {
         try {
           const git = simpleGit(localPath);
           const content = await git.show([`${localHeadSha}:${fileName}`]);
@@ -1040,7 +1068,8 @@ router.get('/api/reviews/:reviewId/file-content/:fileName(*)', validateReviewId,
       }
     }
 
-    // PR mode: use pr_number + repository to find worktree
+    // PR mode: use pr_number + repository to find worktree. ?source is
+    // ignored: in-diff membership comes from the cached PR diff below.
     const prNumber = review.pr_number;
     const repository = review.repository;
 
@@ -1049,10 +1078,8 @@ router.get('/api/reviews/:reviewId/file-content/:fileName(*)', validateReviewId,
     }
 
     const [owner, repo] = repository.split('/');
-    const worktreeManager = new GitWorktreeManager(db);
-    const worktreePath = await worktreeManager.getWorktreePath({ owner, repo, number: prNumber });
-
-    if (!await worktreeManager.worktreeExists({ owner, repo, number: prNumber })) {
+    const worktreePath = await resolveRepoRoot(db, review);
+    if (!worktreePath) {
       return res.status(404).json({ error: 'Worktree not found for this PR. The PR may need to be reloaded.' });
     }
 
@@ -1069,7 +1096,10 @@ router.get('/api/reviews/:reviewId/file-content/:fileName(*)', validateReviewId,
       logger.warn('Could not parse pr_data for file-content route');
     }
 
-    const contentSpecs = resolveOriginalFileContentSpecs(prData, fileName);
+    // Off-diff suggestions use checkout coordinates. A base tip newer than
+    // the merge base may contain different lines in an unchanged file.
+    const contentSpecs = findFileBlobInfoInDiff(prData?.diff, fileName)
+      ? resolveOriginalFileContentSpecs(prData, fileName) : [];
 
     if (contentSpecs.length > 0) {
       try {

@@ -14,17 +14,22 @@ import { listenOnLoopback, closeServer } from '../utils/loopback-server';
  * helpers (generateLocalDiff/computeLocalDiffDigest) produce a non-empty diff
  * within the default 'unstaged'→'untracked' scope. Caller cleans up.
  */
-function createTempRepoWithChanges() {
+function createTempRepoWithChanges(files = ['file.js']) {
   const tempRepo = nodeFs.mkdtempSync(path.join(os.tmpdir(), 'pair-review-analysis-results-'));
   execSync('git init -b main', { cwd: tempRepo, stdio: 'pipe' });
   execSync('git config user.email "test@test.com"', { cwd: tempRepo, stdio: 'pipe' });
   execSync('git config user.name "Test User"', { cwd: tempRepo, stdio: 'pipe' });
-  const repoFile = path.join(tempRepo, 'file.js');
-  nodeFs.writeFileSync(repoFile, 'line 1\nline 2\nline 3\n');
-  execSync('git add file.js', { cwd: tempRepo, stdio: 'pipe' });
+  for (const file of [...files, 'src/context.js']) {
+    const repoFile = path.join(tempRepo, file);
+    nodeFs.mkdirSync(path.dirname(repoFile), { recursive: true });
+    nodeFs.writeFileSync(repoFile, Array.from({ length: 80 }, (_, i) => `line ${i + 1}`).join('\n') + '\n');
+  }
+  execSync('git add .', { cwd: tempRepo, stdio: 'pipe' });
   execSync('git commit -m "initial"', { cwd: tempRepo, stdio: 'pipe' });
-  // Unstaged modification — falls within the default 'unstaged'→'untracked' scope.
-  nodeFs.writeFileSync(repoFile, 'line 1 changed\nline 2\nline 3\nline 4 added\n');
+  // Only these files change; src/context.js remains outside the diff.
+  for (const file of files) {
+    nodeFs.appendFileSync(path.join(tempRepo, file), 'added line\n');
+  }
   return tempRepo;
 }
 
@@ -42,7 +47,7 @@ vi.mock('../../src/git/gitattributes', () => ({
 
 const { GitWorktreeManager } = require('../../src/git/worktree');
 vi.spyOn(GitWorktreeManager.prototype, 'worktreeExists').mockResolvedValue(true);
-vi.spyOn(GitWorktreeManager.prototype, 'getWorktreePath').mockResolvedValue('/tmp/worktree/test');
+vi.spyOn(GitWorktreeManager.prototype, 'getWorktreePath').mockImplementation(async () => fixtureRepo);
 
 const configModule = require('../../src/config');
 vi.spyOn(configModule, 'loadConfig').mockResolvedValue({
@@ -52,13 +57,17 @@ vi.spyOn(configModule, 'loadConfig').mockResolvedValue({
 });
 // Unique per test file so parallel forks never share a config dir on disk.
 const testConfigDir = nodeFs.mkdtempSync(path.join(os.tmpdir(), 'pair-review-cfg-'));
+const fixtureFiles = ['file.js', 'src/index.js', 'src/utils.js', 'app.js', 'a.js', 'b.js', 'c.js', 'README.md', 'utils.js', 'x.js', 'f.js'];
+const fixtureRepo = createTempRepoWithChanges(fixtureFiles);
 vi.spyOn(configModule, 'getConfigDir').mockReturnValue(testConfigDir);
 
 afterAll(() => {
   nodeFs.rmSync(testConfigDir, { recursive: true, force: true });
+  nodeFs.rmSync(fixtureRepo, { recursive: true, force: true });
 });
 
 const { query, queryOne, run, ReviewRepository } = require('../../src/database');
+const { generateScopedDiff } = require('../../src/local-review');
 const ws = require('../../src/ws');
 
 const analysisRoutes = require('../../src/routes/analyses');
@@ -87,6 +96,14 @@ describe('POST /api/analyses/results', () => {
   beforeEach(async () => {
     broadcastSpy = vi.spyOn(ws, 'broadcast').mockImplementation(() => {});
     db = createTestDatabase();
+    for (const prNumber of [42, 77, 583]) {
+      await run(db, `
+        INSERT INTO worktrees (id, pr_number, repository, branch, path, created_at, last_accessed_at)
+        VALUES (?, ?, 'owner/repo', 'test', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      `, [`test-${prNumber}`, prNumber, fixtureRepo]);
+      await run(db, 'INSERT INTO pr_metadata (pr_number, repository, pr_data) VALUES (?, ?, ?)',
+        [prNumber, 'owner/repo', JSON.stringify({ changed_files: fixtureFiles })]);
+    }
     app = createTestApp(db);
     server = await listenOnLoopback(app);
   });
@@ -115,7 +132,7 @@ describe('POST /api/analyses/results', () => {
     const response = await request(server)
       .post('/api/analyses/results')
       .send({
-        path: '/tmp/project',
+        path: fixtureRepo,
         headSha: 'abc123',
         repo: 'owner/repo',
         prNumber: 1,
@@ -129,7 +146,7 @@ describe('POST /api/analyses/results', () => {
   it('should return 400 when path is provided without headSha', async () => {
     const response = await request(server)
       .post('/api/analyses/results')
-      .send({ path: '/tmp/project', suggestions: [] });
+      .send({ path: fixtureRepo, suggestions: [] });
 
     expect(response.status).toBe(400);
     expect(response.body.error).toContain('Must provide either');
@@ -148,7 +165,7 @@ describe('POST /api/analyses/results', () => {
     const response = await request(server)
       .post('/api/analyses/results')
       .send({
-        path: '/tmp/project',
+        path: fixtureRepo,
         headSha: 'abc123',
         suggestions: 'not-an-array'
       });
@@ -161,7 +178,7 @@ describe('POST /api/analyses/results', () => {
     const response = await request(server)
       .post('/api/analyses/results')
       .send({
-        path: '/tmp/project',
+        path: fixtureRepo,
         headSha: 'abc123',
         suggestions: [],
         fileLevelSuggestions: 'not-an-array'
@@ -175,7 +192,7 @@ describe('POST /api/analyses/results', () => {
     const response = await request(server)
       .post('/api/analyses/results')
       .send({
-        path: '/tmp/project',
+        path: fixtureRepo,
         headSha: 'abc123',
         suggestions: [{ file: 'test.js' }]
       });
@@ -212,7 +229,7 @@ describe('POST /api/analyses/results', () => {
     const response = await request(server)
       .post('/api/analyses/results')
       .send({
-        path: '/tmp/project',
+        path: fixtureRepo,
         headSha: 'abc123',
         tier: 'invalid-tier',
         suggestions: []
@@ -228,7 +245,7 @@ describe('POST /api/analyses/results', () => {
       const response = await request(server)
         .post('/api/analyses/results')
         .send({
-          path: '/tmp/project',
+          path: fixtureRepo,
           headSha: `sha-tier-${tier}`,
           tier,
           suggestions: []
@@ -246,7 +263,7 @@ describe('POST /api/analyses/results', () => {
     const response = await request(server)
       .post('/api/analyses/results')
       .send({
-        path: '/tmp/project',
+        path: fixtureRepo,
         headSha: 'sha-alias',
         tier: 'premium',
         suggestions: []
@@ -263,7 +280,7 @@ describe('POST /api/analyses/results', () => {
     const response = await request(server)
       .post('/api/analyses/results')
       .send({
-        path: '/tmp/project',
+        path: fixtureRepo,
         headSha: 'sha-no-tier',
         suggestions: []
       });
@@ -279,7 +296,7 @@ describe('POST /api/analyses/results', () => {
     const response = await request(server)
       .post('/api/analyses/results')
       .send({
-        path: '/tmp/project',
+        path: fixtureRepo,
         headSha: 'abc123',
         suggestions: [],
         fileLevelSuggestions: [{ file: 'test.js', type: 'bug' }]
@@ -295,7 +312,7 @@ describe('POST /api/analyses/results', () => {
     const response = await request(server)
       .post('/api/analyses/results')
       .send({
-        path: '/tmp/my-project',
+        path: fixtureRepo,
         headSha: 'abc123def',
         provider: 'claude',
         model: 'sonnet',
@@ -414,6 +431,54 @@ describe('POST /api/analyses/results', () => {
 
   // --- PR mode happy path ---
 
+  it.each([
+    ['staged', false],
+    ['branch', false],
+    ['branch', true]
+  ])('preserves changed LEFT findings in %s scope (refresh fails: %s)', async (scopeStart, refreshFails) => {
+    const tempRepo = createTempRepoWithChanges(['file.js', 'café.js']);
+    try {
+      if (scopeStart === 'branch') execSync('git checkout -b feature', { cwd: tempRepo, stdio: 'pipe' });
+      nodeFs.unlinkSync(path.join(tempRepo, 'café.js'));
+      execSync('git add -A', { cwd: tempRepo, stdio: 'pipe' });
+      if (scopeStart === 'branch') execSync('git commit -m "scoped changes"', { cwd: tempRepo, stdio: 'pipe' });
+      // No unstaged changes: the default diff-file lookup misses both paths.
+      expect(execSync('git diff --name-only', { cwd: tempRepo, encoding: 'utf8' }).trim()).toBe('');
+      const headSha = execSync('git rev-parse HEAD', { cwd: tempRepo, encoding: 'utf8' }).trim();
+      const reviewRepo = new ReviewRepository(db);
+      const reviewId = await reviewRepo.upsertLocalReview({
+        localPath: tempRepo, localHeadSha: headSha, repository: 'scoped/repo',
+        localHeadBranch: scopeStart === 'branch' ? 'feature' : 'main',
+        scopeStart, scopeEnd: 'unstaged', localBaseBranch: 'main'
+      });
+      if (refreshFails) {
+        const snapshot = await generateScopedDiff(tempRepo, scopeStart, 'unstaged', 'main');
+        await reviewRepo.saveLocalDiff(reviewId, snapshot);
+        await run(db, 'UPDATE reviews SET local_base_branch = ? WHERE id = ?', ['missing-base-branch', reviewId]);
+      }
+
+      const response = await request(server).post('/api/analyses/results').send({
+        path: tempRepo, headSha,
+        suggestions: ['file.js', 'café.js', 'src/context.js'].map(file => ({
+          file, line_start: 10, line_end: 12, old_or_new: 'OLD',
+          type: 'bug', title: 'Scoped finding', description: 'Inspect these lines.'
+        }))
+      });
+
+      expect(response.status).toBe(201);
+      expect(response.body).toMatchObject({ reviewId, totalSuggestions: 3 });
+      const comments = await query(db, 'SELECT file, side, line_start, line_end FROM comments WHERE ai_run_id = ? ORDER BY id', [response.body.runId]);
+      expect(comments).toEqual([
+        { file: 'file.js', side: 'LEFT', line_start: 10, line_end: 12 },
+        { file: 'café.js', side: 'LEFT', line_start: 10, line_end: 12 },
+        { file: 'src/context.js', side: 'RIGHT', line_start: 10, line_end: 12 }
+      ]);
+      expect(await query(db, 'SELECT file FROM context_files WHERE review_id = ?', [reviewId])).toEqual([{ file: 'src/context.js' }]);
+    } finally {
+      nodeFs.rmSync(tempRepo, { recursive: true, force: true });
+    }
+  });
+
   it('should create analysis run and suggestions for PR mode', async () => {
     // Manually insert a review to test the "review already exists" code path
     // (contrast with the test below that verifies auto-creation when no review exists)
@@ -454,17 +519,27 @@ describe('POST /api/analyses/results', () => {
     expect(comments[0].type).toBe('praise');
   });
 
-  it('should create a new review for PR mode if none exists', async () => {
+  it('imports a fresh PR without metadata or a worktree, preserving sides and totals', async () => {
+    expect(await queryOne(db, 'SELECT * FROM pr_metadata WHERE pr_number = 99')).toBeUndefined();
+    expect(await queryOne(db, 'SELECT * FROM worktrees WHERE pr_number = 99')).toBeUndefined();
     const response = await request(server)
       .post('/api/analyses/results')
       .send({
         repo: 'owner/repo',
         prNumber: 99,
-        suggestions: []
+        suggestions: ['OLD', 'NEW'].map((old_or_new, index) => ({
+          file: `./src/file${index}.js`, line_start: 10, line_end: 12, old_or_new,
+          type: 'bug', title: 'Imported issue', description: 'Preserve this finding.'
+        }))
       });
 
     expect(response.status).toBe(201);
     expect(response.body.reviewId).toBeDefined();
+    expect(response.body.totalSuggestions).toBe(2);
+    expect(await query(db, 'SELECT file, side FROM comments WHERE ai_run_id = ? ORDER BY id', [response.body.runId])).toEqual([
+      { file: 'src/file0.js', side: 'LEFT' }, { file: 'src/file1.js', side: 'RIGHT' }
+    ]);
+    expect(await query(db, 'SELECT * FROM context_files WHERE review_id = ?', [response.body.reviewId])).toEqual([]);
 
     // Verify review was created
     const review = await queryOne(db, 'SELECT * FROM reviews WHERE id = ?', [response.body.reviewId]);
@@ -476,11 +551,133 @@ describe('POST /api/analyses/results', () => {
 
   // --- Empty suggestions ---
 
+  describe.each(['Local', 'PR'])('%s out-of-diff suggestions', (mode) => {
+    function payload(suggestions) {
+      return {
+        ...(mode === 'Local'
+          ? { path: fixtureRepo, headSha: 'context-import-sha' }
+          : { repo: 'owner/repo', prNumber: 583 }),
+        suggestions
+      };
+    }
+
+    function finding(overrides = {}) {
+      return {
+        file: 'src/context.js', line_start: 30, line_end: 35,
+        old_or_new: 'OLD', type: 'bug', title: 'Cross-file issue',
+        description: 'The unchanged caller needs to handle the updated contract.',
+        ...overrides
+      };
+    }
+
+    it('creates one context range when importing and no additional range on repeat import', async () => {
+      const body = payload([finding(), finding({ line_start: 32, line_end: 33 })]);
+      const first = await request(server).post('/api/analyses/results').send(body);
+      expect(first.status).toBe(201);
+      expect(first.body.totalSuggestions).toBe(2);
+
+      const reviewId = first.body.reviewId;
+      const contextFiles = await query(db, 'SELECT * FROM context_files WHERE review_id = ?', [reviewId]);
+      expect(contextFiles).toHaveLength(1);
+      expect(contextFiles[0]).toMatchObject({ file: 'src/context.js', line_start: 20, line_end: 45 });
+
+      // An unchanged file has no LEFT side; preserve its actual file line numbers.
+      const comments = await query(db,
+        'SELECT file, side, line_start, line_end FROM comments WHERE ai_run_id = ? ORDER BY line_start',
+        [first.body.runId]);
+      expect(comments).toEqual([
+        { file: 'src/context.js', side: 'RIGHT', line_start: 30, line_end: 35 },
+        { file: 'src/context.js', side: 'RIGHT', line_start: 32, line_end: 33 }
+      ]);
+
+      const contextBroadcasts = () => broadcastSpy.mock.calls.filter(
+        ([topic, event]) => topic === `review:${reviewId}` && event.type === 'review:context_files_changed'
+      );
+      expect(contextBroadcasts()).toHaveLength(1);
+      broadcastSpy.mockClear();
+
+      const second = await request(server).post('/api/analyses/results').send(body);
+      expect(second.status).toBe(201);
+      expect(second.body.reviewId).toBe(reviewId);
+      expect(second.body.totalSuggestions).toBe(2);
+      expect(await query(db, 'SELECT * FROM context_files WHERE review_id = ?', [reviewId])).toEqual(contextFiles);
+      expect(contextBroadcasts()).toHaveLength(0);
+    });
+
+    it('drops nonexistent and unsafe paths while storing existing unchanged files', async () => {
+      const response = await request(server).post('/api/analyses/results').send(payload([
+        finding(),
+        finding({ file: 'src/nonexistent.js' }),
+        finding({ file: '../context.js' }),
+        finding({ file: path.join(fixtureRepo, 'src/context.js') }),
+        finding({ file: 'src' })
+      ]));
+      expect(response.status).toBe(201);
+      expect(response.body.totalSuggestions).toBe(1);
+      const comments = await query(db, 'SELECT file FROM comments WHERE ai_run_id = ?', [response.body.runId]);
+      expect(comments).toEqual([{ file: 'src/context.js' }]);
+      const contexts = await query(db, 'SELECT file FROM context_files WHERE review_id = ?', [response.body.reviewId]);
+      expect(contexts).toEqual([{ file: 'src/context.js' }]);
+    });
+
+    it('converts an out-of-range unchanged finding and seeds a safe context window', async () => {
+      const response = await request(server).post('/api/analyses/results').send(payload([
+        finding({ line_start: 900, line_end: 910 })
+      ]));
+      expect(response.status).toBe(201);
+      expect(response.body.totalSuggestions).toBe(1);
+      expect(await query(db, 'SELECT file, line_start, is_file_level FROM comments WHERE ai_run_id = ?', [response.body.runId]))
+        .toEqual([{ file: 'src/context.js', line_start: null, is_file_level: 1 }]);
+      expect(await query(db, 'SELECT file, line_start, line_end FROM context_files WHERE review_id = ?', [response.body.reviewId]))
+        .toEqual([{ file: 'src/context.js', line_start: 1, line_end: 50 }]);
+    });
+
+    it('preserves a LEFT-side finding when the changed file is shorter in the checkout', async () => {
+      const filePath = path.join(fixtureRepo, 'file.js');
+      const original = nodeFs.readFileSync(filePath, 'utf8');
+      try {
+        nodeFs.writeFileSync(filePath, 'remaining line\n');
+        const response = await request(server).post('/api/analyses/results').send(payload([
+          finding({ file: 'file.js', old_or_new: 'OLD', line_start: 70, line_end: 75 })
+        ]));
+        expect(response.status).toBe(201);
+        const comments = await query(db,
+          'SELECT file, side, line_start, line_end FROM comments WHERE review_id = ? AND ai_run_id = ?',
+          [response.body.reviewId, response.body.runId]);
+        expect(comments).toEqual([
+          { file: 'file.js', side: 'LEFT', line_start: 70, line_end: 75 }
+        ]);
+        expect(await query(db, 'SELECT * FROM context_files WHERE review_id = ?', [response.body.reviewId])).toEqual([]);
+      } finally {
+        nodeFs.writeFileSync(filePath, original);
+      }
+    });
+
+    it('rolls back context creation and sends no context event if an insert fails', async () => {
+      await run(db, `
+        CREATE TRIGGER reject_imported_suggestion BEFORE INSERT ON comments
+        WHEN NEW.title = 'Reject this finding'
+        BEGIN SELECT RAISE(ABORT, 'injected suggestion failure'); END
+      `);
+      const response = await request(server).post('/api/analyses/results').send(payload([
+        finding(), finding({ title: 'Reject this finding' })
+      ]));
+
+      expect(response.status).toBe(500);
+      expect(await query(db, 'SELECT * FROM comments')).toEqual([]);
+      expect(await query(db, 'SELECT * FROM context_files')).toEqual([]);
+      expect(await query(db, 'SELECT * FROM analysis_runs')).toEqual([]);
+      expect(broadcastSpy.mock.calls.filter(
+        ([, event]) => event.type === 'review:context_files_changed'
+      )).toHaveLength(0);
+    });
+  });
+
   it('should create a run with zero suggestions', async () => {
     const response = await request(server)
       .post('/api/analyses/results')
       .send({
-        path: '/tmp/empty-project',
+        path: fixtureRepo,
         headSha: 'deadbeef',
         summary: 'No issues found',
         suggestions: []
@@ -501,7 +698,7 @@ describe('POST /api/analyses/results', () => {
     const response = await request(server)
       .post('/api/analyses/results')
       .send({
-        path: '/tmp/project',
+        path: fixtureRepo,
         headSha: 'sha1',
         suggestions: [
           {
@@ -537,7 +734,7 @@ describe('POST /api/analyses/results', () => {
     const response = await request(server)
       .post('/api/analyses/results')
       .send({
-        path: '/tmp/project',
+        path: fixtureRepo,
         headSha: 'sha2',
         suggestions: [],
         fileLevelSuggestions: [
@@ -569,7 +766,7 @@ describe('POST /api/analyses/results', () => {
     const response = await request(server)
       .post('/api/analyses/results')
       .send({
-        path: '/tmp/project',
+        path: fixtureRepo,
         headSha: 'sha3',
         summary,
         suggestions: [
@@ -592,7 +789,7 @@ describe('POST /api/analyses/results', () => {
     const response = await request(server)
       .post('/api/analyses/results')
       .send({
-        path: '/tmp/project',
+        path: fixtureRepo,
         headSha: 'sha4',
         suggestions: [
           {
@@ -615,7 +812,7 @@ describe('POST /api/analyses/results', () => {
     const response = await request(server)
       .post('/api/analyses/results')
       .send({
-        path: '/tmp/project',
+        path: fixtureRepo,
         headSha: 'sha5',
         suggestions: [
           {
@@ -637,7 +834,7 @@ describe('POST /api/analyses/results', () => {
     const response = await request(server)
       .post('/api/analyses/results')
       .send({
-        path: '/tmp/project',
+        path: fixtureRepo,
         headSha: 'sha-backtick',
         suggestions: [
           {
@@ -662,7 +859,7 @@ describe('POST /api/analyses/results', () => {
     const response = await request(server)
       .post('/api/analyses/results')
       .send({
-        path: '/tmp/project',
+        path: fixtureRepo,
         headSha: 'sha6',
         suggestions: [
           {
@@ -701,7 +898,7 @@ describe('POST /api/analyses/results', () => {
     const response = await request(server)
       .post('/api/analyses/results')
       .send({
-        path: '/tmp/project',
+        path: fixtureRepo,
         headSha: 'sha-norm',
         suggestions: [{
           file: 'a.js', line: 10,
@@ -720,7 +917,7 @@ describe('POST /api/analyses/results', () => {
 
   it('should reuse existing local review on repeat POST with same path+headSha', async () => {
     const payload = {
-      path: '/tmp/same-project',
+      path: fixtureRepo,
       headSha: 'sameSha',
       suggestions: [
         {
@@ -748,7 +945,7 @@ describe('POST /api/analyses/results', () => {
     const response = await request(server)
       .post('/api/analyses/results')
       .send({
-        path: '/tmp/sse-project',
+        path: fixtureRepo,
         headSha: 'ssesha1',
         suggestions: [{
           file: 'a.js', line_start: 1, line_end: 1,

@@ -10,6 +10,8 @@ class SuggestionManager {
     this.prManager = prManagerRef;
     // Concurrency guard for displayAISuggestions
     this._isDisplayingSuggestions = false;
+    this._pendingSuggestions = null;
+    this._pendingSuggestionsCompletion = null;
 
     // Event delegation for "Ask about this" chat button on suggestions
     document.addEventListener('click', (e) => {
@@ -207,15 +209,23 @@ class SuggestionManager {
 
   /**
    * Display AI suggestions inline with diff
-   * Uses a concurrency guard to prevent multiple simultaneous executions
+   * Serializes rendering, coalescing overlapping requests to the latest payload
    * @param {Array} suggestions - Array of suggestions to display
    */
   async displayAISuggestions(suggestions) {
-    // Concurrency guard: prevent multiple simultaneous executions
-    // This avoids duplicated/interleaved suggestions when called rapidly
+    // Context-file loading and analysis refreshes can arrive together. Keep the
+    // latest request so a re-anchor is not lost while another render is running.
     if (this._isDisplayingSuggestions) {
-      console.log('[UI] displayAISuggestions already in progress, skipping');
-      return;
+      this._pendingSuggestions = suggestions;
+      if (!this._pendingSuggestionsCompletion) {
+        const completion = {};
+        completion.promise = new Promise((resolve, reject) => {
+          completion.resolve = resolve;
+          completion.reject = reject;
+        });
+        this._pendingSuggestionsCompletion = completion;
+      }
+      return this._pendingSuggestionsCompletion.promise;
     }
     this._isDisplayingSuggestions = true;
 
@@ -359,7 +369,7 @@ class SuggestionManager {
       });
 
       // Handle file-level suggestions via FileCommentManager
-      if (fileLevelSuggestions.length > 0 && this.prManager?.fileCommentManager) {
+      if (this.prManager?.fileCommentManager) {
         console.log('[UI] Routing file-level suggestions to FileCommentManager:', fileLevelSuggestions.length);
         this.prManager.fileCommentManager.loadFileComments([], fileLevelSuggestions);
       }
@@ -471,6 +481,19 @@ class SuggestionManager {
     } finally {
       // Always clear the guard, even if an error occurred
       this._isDisplayingSuggestions = false;
+      if (this._pendingSuggestions != null) {
+        const pending = this._pendingSuggestions;
+        const completion = this._pendingSuggestionsCompletion;
+        this._pendingSuggestions = null;
+        this._pendingSuggestionsCompletion = null;
+        try {
+          await this.displayAISuggestions(pending);
+          completion.resolve();
+        } catch (error) {
+          completion.reject(error);
+          throw error;
+        }
+      }
     }
   }
 

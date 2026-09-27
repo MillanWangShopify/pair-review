@@ -123,6 +123,82 @@ test.describe('Review Summary Input', () => {
 });
 
 test.describe('Review Submission Success', () => {
+  test('keeps a visible list of comments retained in pair-review after submission', async ({ page }) => {
+    await page.route('**/api/pr/test-owner/test-repo/1/submit-review', route => route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        success: true, comments_submitted: 1,
+        github_url: 'https://github.com/test-owner/test-repo/pull/1#pullrequestreview-1',
+        skipped_comments: [{
+          id: 91, file: 'src/unchanged-helper.js', line_start: 10, line_end: 12,
+          body: 'This caller still needs to handle the new result.', reason: 'outside_diff'
+        }]
+      })
+    }));
+    await page.goto('/pr/test-owner/test-repo/1');
+    await openReviewModal(page);
+    await page.locator('#review-body-modal').fill('Reviewed the changed files.');
+    await page.locator('#submit-review-btn-modal').click();
+
+    await expect(page.locator('.review-modal-overlay')).toBeHidden();
+    const notice = page.locator('#retained-review-comments');
+    await expect(notice).toBeVisible();
+    await expect(notice).toContainText('1 comment kept in pair-review');
+    await expect(notice).toContainText('src/unchanged-helper.js:10–12');
+    await expect(notice).toContainText('This caller still needs to handle the new result.');
+    await expect(notice).toContainText('They remain active in pair-review.');
+
+    // The result remains readable independently of the transient success toast.
+    await page.evaluate(() => document.querySelectorAll('.toast').forEach(toast => toast.remove()));
+    await page.evaluate(() => window.prManager.loadUserComments());
+    await expect(notice).toBeVisible();
+    const heading = await notice.locator('h2').boundingBox();
+    const toolbar = await page.locator('.diff-toolbar').boundingBox();
+    expect(heading.y).toBeGreaterThanOrEqual(toolbar.y + toolbar.height - 1);
+    await notice.getByRole('button', { name: 'Dismiss retained comments notice' }).click();
+    await expect(notice).toHaveCount(0);
+  });
+
+  test('clearing comments also clears the retained-comments notice', async ({ page }) => {
+    await page.goto('/pr/test-owner/test-repo/1');
+    await waitForDiffToRender(page);
+    await page.route('**/api/reviews/*/comments', route => {
+      if (route.request().method() === 'DELETE') {
+        return route.fulfill({ status: 200, contentType: 'application/json', body: '{"deletedCount":1}' });
+      }
+      return route.continue();
+    });
+    await page.evaluate(() => {
+      const row = document.createElement('div');
+      row.className = 'user-comment-row';
+      document.getElementById('diff-container').appendChild(row);
+      window.confirmDialog = { show: async () => 'confirm' };
+      window.prManager.showRetainedCommentsNotice([{
+        file: 'unchanged.js', body: 'Keep this local', line_start: 10
+      }]);
+    });
+    await expect(page.locator('#retained-review-comments')).toBeVisible();
+    await page.evaluate(() => window.prManager.clearAllUserComments());
+    await expect(page.locator('#retained-review-comments')).toHaveCount(0);
+  });
+
+  test('shows retained comments when no GitHub review was submitted', async ({ page }) => {
+    await page.route('**/api/pr/test-owner/test-repo/1/submit-review', route => route.fulfill({
+      status: 400,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        error: 'No review body or comments can be submitted to GitHub.',
+        skippedComments: [{ file: 'unchanged.js', line_start: 10, body: 'Keep this local' }]
+      })
+    }));
+    await page.goto('/pr/test-owner/test-repo/1');
+    await openReviewModal(page);
+    await page.locator('#submit-review-btn-modal').click();
+    await expect(page.locator('.review-modal-overlay')).toBeHidden();
+    await expect(page.locator('#retained-review-comments')).toContainText('Keep this local');
+  });
+
   test('should submit Comment review successfully', async ({ page }) => {
     await page.goto('/pr/test-owner/test-repo/1');
     await openReviewModal(page);

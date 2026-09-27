@@ -141,9 +141,10 @@ class SuggestionNavigator {
    * Update suggestions and rebuild the list
    */
   updateSuggestions(suggestions) {
+    const selectedId = this.suggestions[this.currentSuggestionIndex]?.id;
     // Keep all suggestions visible (adopted and dismissed are de-emphasized but navigatable)
     this.suggestions = suggestions;
-    this.currentSuggestionIndex = -1;
+    this.currentSuggestionIndex = selectedId == null ? -1 : suggestions.findIndex(item => item.id === selectedId);
     this.renderSuggestionsList();
     this.updateCounter();
     this.updateNavigationButtons();
@@ -182,7 +183,7 @@ class SuggestionNavigator {
       const tooltip = locationInfo || 'Location unknown';
 
       return `
-        <div class="suggestion-item ${statusClass}" data-index="${index}" data-id="${suggestion.id}" data-type="${suggestion.type}" data-status="${suggestion.status || 'active'}" title="${this.escapeHtml(tooltip)}">
+        <div class="suggestion-item ${statusClass}${index === this.currentSuggestionIndex ? ' current' : ''}" data-index="${index}" data-id="${suggestion.id}" data-type="${suggestion.type}" data-status="${suggestion.status || 'active'}" title="${this.escapeHtml(tooltip)}">
           <div class="suggestion-type-icon">${typeIcon}</div>
           <div class="suggestion-content">
             <div class="suggestion-preview">${this.escapeHtml(preview)}</div>
@@ -257,7 +258,7 @@ class SuggestionNavigator {
     // this.currentSuggestionIndex — let it own the highlight/scroll.
     if (myGen !== this._navGen) return;
     this.highlightCurrentSuggestion();
-    this.scrollToSuggestion();
+    await this.scrollToSuggestion();
   }
 
   /**
@@ -271,6 +272,9 @@ class SuggestionNavigator {
     const pm = window.prManager;
     if (!file || !pm) return;
     try {
+      if (pm.ensureContextPanelForJump) {
+        await pm.ensureContextPanelForJump(file, suggestion.line_start ?? null);
+      }
       const wrapper = pm.findFileElement?.(file);
       if (wrapper?.classList.contains('collapsed') && pm.toggleFileCollapse) {
         // Renders the lazy body and removes `collapsed`.
@@ -398,9 +402,10 @@ class SuggestionNavigator {
   /**
    * Scroll to current suggestion in diff view
    */
-  scrollToSuggestion() {
+  async scrollToSuggestion() {
     if (this.currentSuggestionIndex >= 0) {
       const currentSuggestion = this.suggestions[this.currentSuggestionIndex];
+      if (!currentSuggestion) return;
       const suggestionEl = document.querySelector(`[data-suggestion-id="${currentSuggestion.id}"]`);
       
       if (suggestionEl) {
@@ -422,6 +427,8 @@ class SuggestionNavigator {
         } else {
           scrollTarget.scrollIntoView(options);
         }
+      } else {
+        window.toast?.showError?.(currentSuggestion._displayError || 'Could not reveal this finding');
       }
     }
   }

@@ -2889,11 +2889,12 @@ class PRManager {
     for (const part of parts) {
       if (!part.trim()) continue;
 
-      // Extract filename from diff --git line
-      const match = part.match(/^diff --git a\/(.+?) b\/(.+)/);
-      if (match) {
-        const fileName = match[2]; // Use the 'b' path (new file path)
-        filePatchMap.set(fileName, part);
+      // Key by the decoded 'b' (new) path from the diff --git line: git
+      // C-quotes non-ASCII names (`"b/caf\303\251.js"`), and the server keys
+      // changed_files, comments and suggestions by the decoded spelling.
+      const paths = window.GitPaths.parseDiffGitPaths(part.split('\n', 1)[0]);
+      if (paths) {
+        filePatchMap.set(paths.newPath, part);
       }
     }
 
@@ -3932,6 +3933,7 @@ class PRManager {
    * @param {Object} pr - PR data with files
    */
   renderDiff(pr) {
+    this.removeRetainedCommentsNotice();
     // Abort any in-flight file content fetches from progressive loading
     this._fileContentsAbort?.abort();
     this._fileContentsAbort = null;
@@ -4033,7 +4035,7 @@ class PRManager {
 
       // Load context files after diff is rendered
       this.contextFiles = [];
-      this.loadContextFiles();
+      this._initialContextFilesLoad = this.loadContextFiles();
 
       // Fetch hunk summaries (Phase 5). Fire-and-forget — the diff is fully
       // usable while summaries arrive asynchronously. Anchors are wired lazily
@@ -4194,10 +4196,9 @@ class PRManager {
   async _materializeDeferredDiff(filePath, options = {}) {
     // reanchor defaults to false to preserve the auto-materialize callers
     // (ensureLinesVisible/expandForSuggestion), which perform reanchoring at a
-    // higher level. The manual "Load diff" click passes reanchor:true. Shared-
-    // cache dedup: whichever call populates _deferredDiffRenderPromises first
-    // wins its reanchor setting — acceptable, because if auto-materialize
-    // (reanchor:false) wins, its caller reanchors anyway.
+    // higher level. Cache only the render work: a manual caller re-anchors
+    // after that promise settles, so an overlapping suggestion display can
+    // await the render without also waiting on its own queued refresh.
     const { reanchor = false } = options;
     if (!filePath) return false;
     if (this.pierreBridge?.files?.has(filePath)) return true;
@@ -4206,16 +4207,22 @@ class PRManager {
     }
 
     const existing = this._deferredDiffRenderPromises.get(filePath);
-    if (existing) return existing;
+    if (existing) {
+      const rendered = await existing;
+      if (rendered && reanchor) {
+        await this._reanchorInlineFeedbackAfterDeferredRender();
+      }
+      return rendered;
+    }
 
     const wrapper = this.findFileElement(filePath);
     const placeholder = wrapper?.querySelector('.large-diff-placeholder');
     const file = this._getChangedFile(filePath);
     if (!wrapper || !placeholder || !file) return false;
 
+    const signal = this._fileContentsAbort?.signal || null;
     let promise;
     promise = (async () => {
-      const signal = this._fileContentsAbort?.signal || null;
       await this._yieldForDiffWork(signal);
       // If renderDiff() re-ran during the idle yield, the review was torn down and
       // rebuilt: the placeholder/wrapper we captured are now detached from the
@@ -4224,15 +4231,19 @@ class PRManager {
       if (signal?.aborted || !wrapper.isConnected || !placeholder.isConnected) {
         return false;
       }
-      await this._renderDeferredDiff(file, wrapper, placeholder, { reanchor });
-      return true;
+      const rendered = await this._renderDeferredDiff(file, wrapper, placeholder, { reanchor: false });
+      return rendered !== false;
     })().finally(() => {
       if (this._deferredDiffRenderPromises.get(filePath) === promise) {
         this._deferredDiffRenderPromises.delete(filePath);
       }
     });
     this._deferredDiffRenderPromises.set(filePath, promise);
-    return promise;
+    const rendered = await promise;
+    if (rendered && reanchor && !signal?.aborted && wrapper.isConnected) {
+      await this._reanchorInlineFeedbackAfterDeferredRender();
+    }
+    return rendered;
   }
 
   async _renderDeferredDiff(file, wrapper, placeholder, options = {}) {
@@ -4256,14 +4267,15 @@ class PRManager {
         if (reanchor) {
           await this._reanchorInlineFeedbackAfterDeferredRender();
         }
+        return true;
       } catch (err) {
         console.error(`Failed to render large diff for ${file.file}:`, err);
         const retryPlaceholder = this._createDeferredDiffPlaceholder(file, wrapper);
         const message = retryPlaceholder.querySelector('span');
         if (message) message.textContent = 'Failed to render large diff';
         diffBody.replaceWith(retryPlaceholder);
+        return false;
       }
-      return;
     }
 
     // Legacy fallback (bridge unavailable). Swap the pending-record buffer so
@@ -4287,6 +4299,7 @@ class PRManager {
     if (reanchor) {
       await this._reanchorInlineFeedbackAfterDeferredRender();
     }
+    return true;
   }
 
   /**
@@ -5379,16 +5392,25 @@ class PRManager {
   }
 
   /**
-   * Fetch original file content for context expansion
+   * Fetch file content for context expansion and context entries.
+   *
+   * Diff files read the diff's old side (Local: HEAD) so expanded gap lines
+   * carry the diff's line numbers. Context entries (files shown outside the
+   * diff) pass `worktree: true`: in Local mode they read the working tree,
+   * the version the AI read and their findings are validated against. PR
+   * mode ignores the flag.
    * @param {string} fileName - The file path
+   * @param {Object} [options]
+   * @param {boolean} [options.worktree=false] - Read a context entry's content
    * @returns {Promise<{lines: string[]}|null>} File content with lines array, or null on error
    */
-  async fetchFileContent(fileName) {
+  async fetchFileContent(fileName, { worktree = false } = {}) {
     const reviewId = this.currentPR?.id;
     if (!reviewId) return null;
 
+    const source = worktree ? '?source=worktree' : '';
     const response = await fetch(
-      `/api/reviews/${reviewId}/file-content/${encodeURIComponent(fileName)}`
+      `/api/reviews/${reviewId}/file-content/${encodeURIComponent(fileName)}${source}`
     );
     const data = await response.json();
 
@@ -5398,6 +5420,17 @@ class PRManager {
     }
 
     return data;
+  }
+
+  /**
+   * fetchFileContent options for content shown in `el`'s file wrapper. Gap
+   * rows exist in both diff files and context entries, and one path can have
+   * both (#540), so the rendered wrapper, not the path, decides.
+   * @param {Element|null} el - A file wrapper or any element inside one
+   * @returns {{worktree: boolean}}
+   */
+  _fileContentOptionsFor(el) {
+    return { worktree: !!el?.closest?.('.d2h-file-wrapper.context-file') };
   }
 
   /**
@@ -5504,7 +5537,7 @@ class PRManager {
     if (!tbody) return;
 
     try {
-      const data = await this.fetchFileContent(fileName);
+      const data = await this.fetchFileContent(fileName, this._fileContentOptionsFor(gapRow));
       if (!data) return;
 
       // Handle EOF_SENTINEL for end-of-file gaps with unknown size
@@ -5659,7 +5692,7 @@ class PRManager {
     if (!tbody) return;
 
     try {
-      const data = await this.fetchFileContent(fileName);
+      const data = await this.fetchFileContent(fileName, this._fileContentOptionsFor(gapRow));
       if (!data) return;
 
       const fragment = document.createDocumentFragment();
@@ -5847,7 +5880,7 @@ class PRManager {
     // Handle EOF_SENTINEL for end-of-file gaps with unknown size
     // When gapEnd is EOF_SENTINEL, determine actual file size from fetched content
     if (gapEnd === window.HunkParser.EOF_SENTINEL) {
-      const data = await this.fetchFileContent(file);
+      const data = await this.fetchFileContent(file, this._fileContentOptionsFor(fileElement));
       if (data && data.lines) {
         gapEnd = data.lines.length;
         // Also update gapEndNew to maintain the same offset
@@ -5964,13 +5997,30 @@ class PRManager {
       // only a middle line is visible. Endpoints may occupy different gaps;
       // re-query after expansion because it replaces rows.
       for (const line of new Set([line_start, line_end || line_start])) {
-        const visible = Array.from(fileElement.querySelectorAll('tr'))
-          .some(row => this.getLineNumber(row, resolvedSide) === line);
-        if (!visible) {
+        if (!this._findRenderedLineRow(fileElement, line, resolvedSide)) {
           await this.expandForSuggestion(file, line, line_end || line_start, resolvedSide);
         }
       }
     }
+  }
+
+  /**
+   * Find the table row rendering `line` on `side` inside a table-rendered file
+   * wrapper (legacy diff bodies and outside-diff context files). This is the
+   * lookup ensureLinesVisible uses to decide whether a line still needs a gap
+   * expansion. Callers must render a lazy diff body first
+   * (ensureFileBodyRendered); Pierre files are answered by
+   * pierreBridge.isLineVisible instead.
+   * @param {Element} fileElement - The file wrapper
+   * @param {number} line - Line number in `side`'s coordinates
+   * @param {string} side - 'LEFT' or 'RIGHT'
+   * @returns {Element|null} The line row, or null when it is not rendered
+   */
+  _findRenderedLineRow(fileElement, line, side) {
+    for (const row of fileElement.querySelectorAll('tr')) {
+      if (this.getLineNumber(row, side) === line) return row;
+    }
+    return null;
   }
 
   /**
@@ -6477,6 +6527,7 @@ class PRManager {
 
       const result = await response.json();
       const deletedCount = result.deletedCount || totalComments;
+      this.removeRetainedCommentsNotice();
 
       // Remove line-level comment rows from DOM
       lineCommentRows.forEach(row => row.remove());
@@ -6620,21 +6671,17 @@ class PRManager {
           const fileElement = this.findFileElement(comment.file);
           if (!fileElement) return;
 
-          const side = comment.side || 'RIGHT';
-          const lineRows = fileElement.querySelectorAll('tr');
-          for (const row of lineRows) {
-            const lineNum = this.getLineNumber(row, side);
-            if (lineNum === comment.line_start) {
-              this.displayUserComment(comment, row);
-              break;
-            }
-          }
+          const row = this._findRenderedLineRow(fileElement, comment.line_start, comment.side || 'RIGHT');
+          if (row) this.displayUserComment(comment, row);
         });
       }
 
-      // Load file-level comments into their zones (only active comments reach here)
+      // Load file-level comments into their zones (only active comments reach here).
+      // Pass null suggestions: loadFileComments treats ANY suggestions array,
+      // even an empty one, as a replacement list and would clear the
+      // file-level AI cards SuggestionManager rendered.
       if (this.fileCommentManager && fileLevelComments.length > 0) {
-        this.fileCommentManager.loadFileComments(fileLevelComments, []);
+        this.fileCommentManager.loadFileComments(fileLevelComments, null);
       }
 
       // Populate AI Panel with all comments (including dismissed if requested)
@@ -7406,51 +7453,48 @@ class PRManager {
   }
 
   /**
-   * Submit review to GitHub
+   * Keep skipped submission comments visible after the review dialog closes.
+   * The notice lives outside the diff so comment/diff refreshes preserve it.
    */
-  async submitReview() {
-    const reviewEvent = document.getElementById('review-event').value;
-    const reviewBody = document.getElementById('review-body').value.trim();
-    const submitBtn = document.getElementById('submit-review-btn');
+  showRetainedCommentsNotice(comments = []) {
+    this.removeRetainedCommentsNotice();
+    if (!comments.length) return;
+    const diffContainer = document.getElementById('diff-container');
+    if (!diffContainer) return;
 
-    // Count BOTH line-level and file-level comments for validation
-    const lineComments = document.querySelectorAll('.user-comment-row:not(.suggestion-edit-pending)').length;
-    const fileComments = document.querySelectorAll('.file-comment-card.user-comment').length;
-    const totalComments = lineComments + fileComments;
-    if (reviewEvent === 'REQUEST_CHANGES' && !reviewBody && totalComments === 0) {
-      alert('Please add comments or a review summary when requesting changes.');
-      return;
+    const notice = document.createElement('section');
+    notice.id = 'retained-review-comments';
+    notice.className = 'retained-review-comments';
+    notice.setAttribute('role', 'status');
+    const heading = document.createElement('h2');
+    heading.textContent = `${comments.length} comment${comments.length === 1 ? '' : 's'} kept in pair-review`;
+    const close = document.createElement('button');
+    close.type = 'button';
+    close.className = 'retained-review-comments-close';
+    close.setAttribute('aria-label', 'Dismiss retained comments notice');
+    close.textContent = '×';
+    close.addEventListener('click', () => this.removeRetainedCommentsNotice());
+    const explanation = document.createElement('p');
+    explanation.textContent = 'These comments were not submitted because their files are outside the PR diff. They remain active in pair-review.';
+    const list = document.createElement('ul');
+    for (const comment of comments) {
+      const item = document.createElement('li');
+      const location = document.createElement('strong');
+      const start = comment.line_start;
+      const end = comment.line_end;
+      location.textContent = comment.file + (start ? `:${start}${end && end !== start ? `–${end}` : ''}` : '');
+      const body = document.createElement('p');
+      body.textContent = comment.body;
+      item.append(location, body);
+      list.appendChild(item);
     }
+    notice.append(close, heading, explanation, list);
+    diffContainer.before(notice);
+    notice.scrollIntoView?.({ block: 'start' });
+  }
 
-    const originalText = submitBtn.textContent;
-    submitBtn.textContent = 'Submitting...';
-    submitBtn.disabled = true;
-
-    try {
-      const response = await fetch(`/api/pr/${this.currentPR.owner}/${this.currentPR.repo}/${this.currentPR.number}/submit-review`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ event: reviewEvent, body: reviewBody })
-      });
-
-      if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.error || 'Failed to submit review');
-      }
-
-      const result = await response.json();
-      alert(`Review submitted successfully! ${result.message}`);
-
-      document.getElementById('review-body').value = '';
-      document.getElementById('review-event').value = 'COMMENT';
-
-    } catch (error) {
-      console.error('Error submitting review:', error);
-      alert(`Failed to submit review: ${error.message}`);
-    } finally {
-      submitBtn.textContent = originalText;
-      submitBtn.disabled = false;
-    }
+  removeRetainedCommentsNotice() {
+    document.getElementById('retained-review-comments')?.remove();
   }
 
   /**
@@ -8810,12 +8854,13 @@ class PRManager {
       // Rebuild sidebar with context files interleaved in natural path order
       this.rebuildFileListWithContext();
 
-      // Re-anchor comments after new context files are rendered so that
-      // comments targeting lines in these files find their DOM targets.
-      // loadUserComments() is idempotent (clears existing comment rows first).
+      // Suggestions can arrive before context wrappers (on initial load or
+      // via separate WebSocket events). Re-anchor both kinds of feedback after
+      // the whole batch renders, including ranges beyond the seeded windows.
       if (newFilesRendered) {
         const includeDismissed = window.aiPanel?.showDismissedComments || false;
         await this.loadUserComments(includeDismissed);
+        await this.loadAISuggestions(null, this.selectedRunId);
       }
     } catch (error) {
       console.error('Error loading context files:', error);
@@ -8975,7 +9020,7 @@ class PRManager {
     if (!diffContainer) return;
 
     // Fetch file content
-    const data = await this.fetchFileContent(contextFile.file);
+    const data = await this.fetchFileContent(contextFile.file, { worktree: true });
     if (!data || !data.lines) return;
 
     // Check if a wrapper already exists for this file
@@ -9268,6 +9313,47 @@ class PRManager {
           row.classList.remove('chat-line-highlight');
         }, { once: true });
       }
+    }
+  }
+
+  /** Restore an absent outside-diff panel only for an explicit feedback jump. */
+  async ensureContextPanelForJump(file, lineStart = null) {
+    if (!file || !this.currentPR?.id) return;
+    if (this.diffFiles?.some(entry => entry.file === file)) return;
+
+    // Serialize jumps for one file, then check the requested line again. Two
+    // different findings can need different context windows in that file.
+    this._contextPanelJumps ||= new Map();
+    const previous = this._contextPanelJumps.get(file);
+    const pending = (async () => {
+      if (previous) await previous;
+      await this._initialContextFilesLoad;
+      const wrapper = this.findFileElement(file);
+      const covering = this.contextFiles?.some(entry => entry.file === file &&
+        (lineStart == null || (entry.line_start <= lineStart && entry.line_end >= lineStart)));
+      if (wrapper && covering) return { type: 'context' };
+      // Gap expansion reveals later findings inside the seeded chunk without
+      // storing a row, so no entry covers them. The line is already on screen:
+      // adding another context row would render a duplicate chunk. Context
+      // files are eagerly built tables (never lazy or virtualized), so a DOM
+      // row is exactly "rendered". Their old and new numbers match.
+      if (wrapper && lineStart != null && this._findRenderedLineRow(wrapper, lineStart, 'RIGHT')) {
+        return { type: 'context' };
+      }
+      // A cached row may have failed to render. Make it new to the loader so
+      // the next refresh actually retries its wrapper.
+      if (!wrapper && covering) {
+        this.contextFiles = this.contextFiles.filter(entry => entry.file !== file);
+        await this.loadContextFiles();
+        if (this.findFileElement(file)) return { type: 'context' };
+      }
+      return this.ensureContextFile(file, lineStart);
+    })();
+    this._contextPanelJumps.set(file, pending);
+    try {
+      return await pending;
+    } finally {
+      if (this._contextPanelJumps.get(file) === pending) this._contextPanelJumps.delete(file);
     }
   }
 

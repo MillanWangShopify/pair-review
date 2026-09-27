@@ -7,28 +7,23 @@
  * rendered patch, even if cached PR metadata drifts.
  */
 
+const { decodeGitPath } = require('./git-paths');
+
 function parseDiffGitPaths(headerLine) {
   if (!headerLine.startsWith('diff --git ')) {
     return null;
   }
 
   const rest = headerLine.slice('diff --git '.length);
-  const quotedMatch = rest.match(/^"a\/(.+)" "b\/(.+)"$/);
-  if (quotedMatch) {
-    return {
-      oldPath: quotedMatch[1].replace(/\\"/g, '"'),
-      newPath: quotedMatch[2].replace(/\\"/g, '"')
-    };
-  }
-
-  const plainMatch = rest.match(/^a\/(.+?) b\/(.+)$/);
-  if (!plainMatch) {
-    return null;
-  }
+  const match = rest.match(/^("(?:[^"\\]|\\.)*"|a\/.+?) ("(?:[^"\\]|\\.)*"|b\/.+)$/);
+  if (!match) return null;
+  const oldPath = decodeGitPath(match[1]);
+  const newPath = decodeGitPath(match[2]);
+  if (!oldPath.startsWith('a/') || !newPath.startsWith('b/')) return null;
 
   return {
-    oldPath: plainMatch[1],
-    newPath: plainMatch[2]
+    oldPath: oldPath.slice(2),
+    newPath: newPath.slice(2)
   };
 }
 

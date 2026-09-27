@@ -3612,7 +3612,7 @@ describe('ChatPanel', () => {
 
       expect(global.fetch).toHaveBeenCalledTimes(1);
       expect(global.fetch).toHaveBeenCalledWith(
-        '/api/reviews/42/file-content/src%2Fauth.js'
+        '/api/reviews/42/file-content/src%2Fauth.js?source=worktree'
       );
       // Diff-hunk extractor never runs without a patch.
       expect(window.DiffContext.extractHunkForLines).not.toHaveBeenCalled();

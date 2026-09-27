@@ -38,6 +38,42 @@ afterEach(() => {
   delete window.prManager;
 });
 
+describe('SuggestionNavigator context restoration', () => {
+  it('keeps selection by ID when refresh reorders items, clearing it only when removed', () => {
+    const nav = new SuggestionNavigator();
+    nav.suggestions = [{ id: 'first' }, { id: 'selected' }];
+    nav.currentSuggestionIndex = 1;
+    nav.updateSuggestions([{ id: 'selected' }, { id: 'first' }]);
+    expect(nav.currentSuggestionIndex).toBe(0);
+    expect(nav.element.querySelector('.suggestion-item.current').dataset.id).toBe('selected');
+    nav.updateSuggestions([{ id: 'first' }]);
+    expect(nav.currentSuggestionIndex).toBe(-1);
+    expect(nav.element.querySelector('.suggestion-item.current')).toBeNull();
+  });
+
+  it('preserves the clicked suggestion across the reload that creates its panel', async () => {
+    const nav = new SuggestionNavigator();
+    const suggestion = { id: 'outside', file: 'outside.js', line_start: 180 };
+    nav.suggestions = [suggestion];
+    nav.currentSuggestionIndex = 0;
+    const target = document.createElement('div');
+    target.dataset.suggestionId = 'outside';
+    target.scrollIntoView = vi.fn();
+    window.prManager = {
+      ensureContextPanelForJump: vi.fn(async () => {
+        nav.updateSuggestions([{ id: 'new-first' }, suggestion]);
+        document.body.appendChild(target);
+      })
+    };
+    await nav.goToSuggestion(0);
+    expect(window.prManager.ensureContextPanelForJump).toHaveBeenCalledWith('outside.js', 180);
+    expect(nav.currentSuggestionIndex).toBe(1);
+    expect(nav.element.querySelector('.suggestion-item.current').dataset.id).toBe('outside');
+    expect(target.classList.contains('current-suggestion')).toBe(true);
+    expect(target.scrollIntoView).toHaveBeenCalled();
+  });
+});
+
 describe('SuggestionNavigator.goToSuggestion', () => {
   it('expands a collapsed file before highlight/scroll', async () => {
     const wrapper = document.createElement('div');
@@ -150,5 +186,24 @@ describe('SuggestionNavigator.goToSuggestion', () => {
     // Only the latest call highlights, and it sees its own (latest) index.
     expect(highlighted).toEqual([1]);
     expect(nav.currentSuggestionIndex).toBe(1);
+  });
+
+  it('preserves the selected id when suggestions refresh during a pending jump', async () => {
+    let release;
+    window.prManager = {
+      ensureContextPanelForJump: vi.fn(() => new Promise(resolve => { release = resolve; })),
+      findFileElement: vi.fn(() => null)
+    };
+    const nav = makeNavigator();
+    nav.suggestions = [{ id: 'first', file: 'outside.js', line_start: 20 },
+      { id: 'selected', file: 'outside.js', line_start: 40 }];
+    const pending = nav.goToSuggestion(1);
+    nav.updateSuggestions([{ id: 'selected', file: 'outside.js', line_start: 40 },
+      { id: 'first', file: 'outside.js', line_start: 20 }]);
+    release();
+    await pending;
+    expect(nav.currentSuggestionIndex).toBe(0);
+    expect(nav.highlightCurrentSuggestion).toHaveBeenCalled();
+    expect(nav.scrollToSuggestion).toHaveBeenCalled();
   });
 });

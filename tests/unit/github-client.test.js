@@ -1347,6 +1347,21 @@ describe('GitHubClient', () => {
 
       expect(client.calculateDiffPosition(diff, 'other-file.js', 1)).toBe(-1);
     });
+
+    it('should match a file whose diff header git C-quoted', () => {
+      const client = new GitHubClient('test-token');
+      const diff = [
+        String.raw`diff --git "a/caf\303\251.js" "b/caf\303\251.js"`,
+        String.raw`--- "a/caf\303\251.js"`,
+        String.raw`+++ "b/caf\303\251.js"`,
+        '@@ -1,2 +1,3 @@',
+        ' line1',
+        '+added',
+        ' line2'
+      ].join('\n');
+
+      expect(client.calculateDiffPosition(diff, 'café.js', 2)).toBe(2);
+    });
   });
 
   describe('getPendingReviewForUser', () => {
