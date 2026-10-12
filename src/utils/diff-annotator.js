@@ -14,8 +14,12 @@ const logger = require('./logger');
  */
 function parseHunkHeader(header) {
   // Match: @@ -oldStart,oldCount +newStart,newCount @@ optional context
-  // Count can be omitted, defaulting to 1
-  const match = header.match(/^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@(.*)$/);
+  // Count can be omitted, defaulting to 1. The `s` (dotAll) flag lets the
+  // trailing context span a carriage return: git trims trailing whitespace
+  // from the function-context line but keeps a lone `\r` inside it, and
+  // without dotAll `.` stops at that `\r`, `$` cannot match, and the whole
+  // header is rejected, so its hunk body goes uncounted.
+  const match = header.match(/^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@(.*)$/s);
 
   if (!match) {
     return null;
@@ -75,6 +79,13 @@ function getLineContent(line) {
 
 /**
  * Parse file header lines to extract old and new file paths
+ *
+ * CALLER CONTRACT: only call this on lines that are OUTSIDE a hunk body. It
+ * returns `true` for anything merely starting with `---`, `+++`, `index ` or
+ * `diff --git`, and those prefixes are ordinary CONTENT inside a hunk (a
+ * deleted `-- x` is emitted as `--- x`, an added `++ x` as `+++ x`). Both
+ * loops in this file enforce that with an `!inHunk` guard.
+ *
  * @param {string} line - A diff line that might be a file header
  * @param {Object} currentFile - Current file info to update
  * @returns {boolean} Whether this was a file header line
@@ -220,8 +231,13 @@ function annotateDiff(rawDiff) {
       continue;
     }
 
-    // Parse file header lines
-    if (parseFileHeader(line, currentFile)) {
+    // Parse file header lines. Guarded on `!inHunk`: inside a hunk body these
+    // prefixes are content, and letting `parseFileHeader` claim them both
+    // corrupts the file path (an added `++ x` line arrives as `+++ x`) and
+    // skips the counter-advancing branches below, shifting every later anchor
+    // in the file. `git diff` opens every file with `diff --git`, which resets
+    // `inHunk` above before that file's real headers arrive.
+    if (!inHunk && parseFileHeader(line, currentFile)) {
       // Check if we just detected a binary file that needs output
       if (currentFile.isBinary && fileStarted && !fileHeaderOutput) {
         let filePath = currentFile.newPath || currentFile.oldPath || 'unknown';
@@ -412,6 +428,16 @@ function parseAnnotatedDiff(annotatedDiff) {
  * Used to determine whether a comment targets a line GitHub can render inline
  * (inside a hunk) vs. one that must be submitted as file-level.
  *
+ * File headers are only headers OUTSIDE a hunk body. `parseFileHeader`
+ * returns `true` for anything starting with `---`, `+++`, `index ` or
+ * `diff --git`, and inside a hunk those are content: a deleted `-- x` line is
+ * emitted as `--- x`, an added `++ x` as `+++ x`, and an unindented `++i;` as
+ * `+++i;`. Letting the header parser claim them overwrote the section's path
+ * with a fragment of source code AND skipped the counter-advancing branch,
+ * shifting every later RIGHT anchor in the file by one. The `!inHunk` guard is
+ * what makes those lines fall through to the ordinary `+`/`-` accounting where
+ * they belong.
+ *
  * Each line also records the hunk it belongs to, so a caller can tell
  * whether two lines share a hunk: GitHub only accepts a multi-line comment
  * whose two ends are in the same hunk.
@@ -449,7 +475,9 @@ function buildDiffLineSet(rawDiff) {
       continue;
     }
 
-    if (parseFileHeader(line, currentFile)) {
+    // Header lines are headers only outside a hunk body — see the docblock.
+    // Inside one they fall through to the +/- accounting below.
+    if (!inHunk && parseFileHeader(line, currentFile)) {
       continue;
     }
 
