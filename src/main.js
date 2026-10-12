@@ -7,6 +7,7 @@ const { loadConfig, getConfigDir, showWelcomeMessage, resolveDbName, resolveRepo
 const { initializeDatabase, run, queryOne, query, migrateExistingWorktrees, WorktreeRepository, ReviewRepository, RepoSettingsRepository, GitHubReviewRepository, WorktreePoolRepository, CouncilRepository, CommentRepository, AnalysisRunRepository, PRMetadataRepository } = require('./database');
 const { PRArgumentParser } = require('./github/parser');
 const { GitHubClient } = require('./github/client');
+const { buildSubmitPrContext } = require('./github/submit-pr-context');
 const { GitWorktreeManager } = require('./git/worktree');
 const { fetchNoTags } = require('./git/fetch-helpers');
 const { cleanupOrphanedKeepFiles } = require('./git/pack-cleanup');
@@ -30,6 +31,7 @@ const { resolvePreflightBinding, setupHostParam, bindingRepositoryForHost } = re
 const { fireReviewStartedHook } = require('./hooks/payloads');
 const { normalizeRepository, resolveRenamedFile, resolveRenamedFileOld } = require('./utils/paths');
 const { rejectUrlLikeLocalReviewPath } = require('./utils/local-path-input');
+const { buildReviewComments } = require('./utils/diff-annotator');
 const logger = require('./utils/logger');
 const simpleGit = require('simple-git');
 const { getGeneratedFilePatterns } = require('./git/gitattributes');
@@ -1343,6 +1345,50 @@ function formatAISuggestion(text, category) {
 }
 
 /**
+ * Load the final AI suggestions a headless (--ai-draft / --ai-review) review
+ * submits: the review's active, orchestrated (not per-level), non-raw AI
+ * findings. The rows carry everything buildReviewComments needs to map them
+ * to GitHub comments: side (LEFT for a deleted line), the range end and the
+ * file-level flag.
+ *
+ * Rows GitHub cannot take are skipped and reported: those without a file
+ * path, and line findings without a positive line number. File-level
+ * findings (is_file_level = 1) need no line.
+ *
+ * @param {Object} db - Database instance
+ * @param {number} reviewId - reviews.id the findings belong to
+ * @returns {Promise<Array<Object>>} Submittable suggestion rows, ordered by file and line
+ */
+async function loadHeadlessSuggestions(db, reviewId) {
+  const rows = await query(db, `
+    SELECT
+      id,
+      file,
+      line_start,
+      line_end,
+      body,
+      diff_position,
+      side,
+      title,
+      type,
+      is_file_level
+    FROM comments
+    WHERE review_id = ? AND source = 'ai' AND ai_level IS NULL AND (is_raw = 0 OR is_raw IS NULL) AND status = 'active'
+    ORDER BY file, line_start
+  `, [reviewId]);
+
+  return rows.filter(suggestion => {
+    const hasValidPath = typeof suggestion.file === 'string' && suggestion.file.trim() !== '';
+    const hasValidLine = suggestion.is_file_level === 1 || suggestion.line_start > 0;
+    if (!hasValidPath || !hasValidLine) {
+      logger.warn(`Skipping suggestion for ${suggestion.file || 'unknown file'}:${suggestion.line_start || 'unknown line'} - missing valid line or path information`);
+      return false;
+    }
+    return true;
+  });
+}
+
+/**
  * Shared implementation for headless (non-interactive) review modes.
  * Used by both --ai-draft and --ai-review.
  *
@@ -1678,21 +1724,9 @@ async function performHeadlessReview(args, config, db, flags, options, externalP
       throw new Error(`AI analysis failed: ${analysisError.message}`);
     }
 
-    // Query for final AI suggestions (orchestrated, not per-level)
-    // Use review.id (not prMetadata.id) to match how comments are stored
-    const aiSuggestions = await query(db, `
-      SELECT
-        id,
-        file,
-        line_start,
-        body,
-        diff_position,
-        title,
-        type
-      FROM comments
-      WHERE review_id = ? AND source = 'ai' AND ai_level IS NULL AND (is_raw = 0 OR is_raw IS NULL) AND status = 'active'
-      ORDER BY file, line_start
-    `, [review.id]);
+    // Final AI suggestions (orchestrated, not per-level). Use review.id (not
+    // prMetadata.id) to match how comments are stored.
+    const aiSuggestions = await loadHeadlessSuggestions(db, review.id);
 
     console.log(`Found ${aiSuggestions.length} AI suggestions to submit`);
 
@@ -1701,39 +1735,14 @@ async function performHeadlessReview(args, config, db, flags, options, externalP
       return; // Exit gracefully without creating a review
     }
 
-    // Filter out suggestions without valid line information
-    // Note: diff positions will be recalculated fresh by GitHub client
-    const validSuggestions = aiSuggestions.filter(suggestion => {
-      const hasValidLine = suggestion.line_start && suggestion.line_start > 0;
-      const hasValidPath = suggestion.file && suggestion.file.trim() !== '';
-
-      if (!hasValidLine || !hasValidPath) {
-        console.warn(`Skipping suggestion for ${suggestion.file || 'unknown file'}:${suggestion.line_start || 'unknown line'} - missing valid line or path information`);
-        return false;
-      }
-
-      return true;
-    });
-
-    console.log(`Filtered to ${validSuggestions.length} suggestions with valid line information`);
-
-    if (validSuggestions.length === 0) {
-      console.log('No suggestions with valid line information. Exiting without creating review.');
-      return; // Exit gracefully without creating a review
-    }
-
-    // Format AI suggestions for GitHub
-    const githubComments = validSuggestions.map(suggestion => {
-      // Format with emoji and category prefix, same as adopted suggestions
-      const formattedBody = formatAISuggestion(suggestion.body, suggestion.type);
-
-      return {
-        path: suggestion.file,
-        line: suggestion.line_start,
-        body: formattedBody,
-        side: 'RIGHT',    // AI suggestions always target added/modified code
-        isFileLevel: false // AI suggestions always target specific lines
-      };
+    // Same mapping as the web submit route: each comment keeps its side,
+    // ranges keep start_line, file-level findings stay file-level, and a line
+    // outside every diff hunk becomes a file-level comment with a
+    // "(Ref Line N)" prefix. Only the body formatting is headless-specific.
+    // Diff positions are recalculated fresh by the GitHub client.
+    const githubComments = buildReviewComments(aiSuggestions, diff, {
+      // Same emoji + category prefix as adopted suggestions
+      formatBody: suggestion => formatAISuggestion(suggestion.body, suggestion.type)
     });
 
     // Build review body with AI-generated summary
@@ -1746,7 +1755,7 @@ ${analysisSummary}
 > Generated by [pair-review](https://github.com/in-the-loop-labs/pair-review) with \`${footerFlag}\` mode`
       : `## AI Analysis Summary
 
-Found ${validSuggestions.length} suggestion${validSuggestions.length === 1 ? '' : 's'} from automated analysis.
+Found ${aiSuggestions.length} suggestion${aiSuggestions.length === 1 ? '' : 's'} from automated analysis.
 
 > Generated by [pair-review](https://github.com/in-the-loop-labs/pair-review) with \`${footerFlag}\` mode`;
 
@@ -1781,12 +1790,17 @@ Found ${validSuggestions.length} suggestion${validSuggestions.length === 1 ? '' 
 
     const prNodeId = storedPRData.node_id ?? null;
 
-    const submitPrContext = {
+    // Same builder as the web submit route: carries the draft's numeric review
+    // id and the PR head SHA that alt-hosts require as each inline comment's
+    // commit_id (without it they reject the comments with a 422).
+    const submitPrContext = buildSubmitPrContext({
       owner: prInfo.owner,
       repo: prInfo.repo,
       prNumber: prInfo.number,
-      reviewId: existingDraft?.databaseId
-    };
+      existingDraft,
+      prData: storedPRData,
+      prMetadata
+    });
 
     let githubReview;
     if (options.reviewEvent === 'DRAFT') {
@@ -1848,9 +1862,9 @@ Found ${validSuggestions.length} suggestion${validSuggestions.length === 1 ? '' 
       });
 
       // Update AI suggestions to appropriate status (batch update for performance)
-      // Use validSuggestions (not aiSuggestions) to only update those that were actually submitted
-      if (validSuggestions.length > 0) {
-        const suggestionIds = validSuggestions.map(s => s.id);
+      // Only the submitted suggestions (loadHeadlessSuggestions skipped the rest)
+      if (aiSuggestions.length > 0) {
+        const suggestionIds = aiSuggestions.map(s => s.id);
         const placeholders = suggestionIds.map(() => '?').join(',');
         await run(db, `
           UPDATE comments
@@ -3035,4 +3049,4 @@ if (require.main === module) {
   main();
 }
 
-module.exports = { main, parseArgs, detectPRFromGitHubEnvironment, printCouncilList, handleHeadlessAnalysis, handleHeadlessDelegated, runHeadlessAnalysis, buildHeadlessJson, buildHeadlessErrorJson, emitHeadlessResult, resolveCliInstructions, resolveCliBindingRepository, startPoolBackgroundFetches, isPoolEntryDueForFetch, POOL_FETCH_TICK_MS, MAX_POOL_FETCH_BACKOFF_MS };
+module.exports = { main, parseArgs, detectPRFromGitHubEnvironment, printCouncilList, handleHeadlessAnalysis, handleHeadlessDelegated, runHeadlessAnalysis, buildHeadlessJson, buildHeadlessErrorJson, emitHeadlessResult, loadHeadlessSuggestions, resolveCliInstructions, resolveCliBindingRepository, startPoolBackgroundFetches, isPoolEntryDueForFetch, POOL_FETCH_TICK_MS, MAX_POOL_FETCH_BACKOFF_MS };

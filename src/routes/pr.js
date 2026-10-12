@@ -32,13 +32,14 @@ const { resolveHostName } = require('../links/repo-links');
 const { resolveHostListText } = require('../links/host-names');
 const { backgroundQueue } = require('../ai/background-queue');
 const logger = require('../utils/logger');
-const { buildDiffLineSet } = require('../utils/diff-annotator');
+const { buildReviewComments } = require('../utils/diff-annotator');
 const { broadcastReviewEvent } = require('../events/review-events');
 const { fireHooks, hasHooks } = require('../hooks/hook-runner');
 const { buildReviewStartedPayload, buildReviewLoadedPayload, buildAnalysisStartedPayload, buildAnalysisCompletedPayload, getCachedUser } = require('../hooks/payloads');
 const simpleGit = require('simple-git');
 const { GIT_DIFF_FLAGS_ARRAY, GIT_DIFF_SUMMARY_FLAGS_ARRAY } = require('../git/diff-flags');
 const { walkPRStack, DEFAULT_TRUNK_BRANCHES } = require('../github/stack-walker');
+const { buildSubmitPrContext } = require('../github/submit-pr-context');
 const summaryGenerator = require('../ai/summary-generator');
 const tourGenerator = require('../ai/tour-generator');
 const {
@@ -1571,65 +1572,8 @@ router.post('/api/pr/:owner/:repo/:number/submit-review', async (req, res) => {
     //
     // We check whether the comment's target line actually appears in a diff hunk
     // rather than relying on diff_position (which may not be set by all sources).
-    const diffLineSet = buildDiffLineSet(diffContent);
-
-    const graphqlComments = comments.map(comment => {
-      const side = comment.side || 'RIGHT';
-      const isRange = comment.line_end && comment.line_end !== comment.line_start;
-
-      // Check if this is an explicit file-level comment (is_file_level=1)
-      // These are comments about the entire file, not tied to specific lines
-      if (comment.is_file_level === 1) {
-        console.log(`Formatting file-level comment: ${comment.file}`);
-
-        return {
-          path: comment.file,
-          body: comment.body,
-          isFileLevel: true
-        };
-      }
-
-      // Detect expanded context comments by checking whether the target line
-      // actually appears in a diff hunk. This is more reliable than checking
-      // diff_position, which may be absent for comments created by the chat agent.
-      // For range comments, both endpoints must be inside the diff; if the start
-      // line falls outside a hunk but the end is inside, submitting with start_line
-      // would produce a position GitHub cannot render.
-      const isExpandedContext = isRange
-        ? !diffLineSet.isLineInDiff(comment.file, comment.line_start, side) || !diffLineSet.isLineInDiff(comment.file, comment.line_end, side)
-        : !diffLineSet.isLineInDiff(comment.file, comment.line_start, side);
-
-      if (isExpandedContext) {
-        // File-level comment with line reference prefix
-        const lineRef = isRange
-          ? `(Ref Lines ${comment.line_start}-${comment.line_end})`
-          : `(Ref Line ${comment.line_start})`;
-
-        console.log(`Formatting file-level comment (expanded context): ${comment.file} ${lineRef}`);
-
-        return {
-          path: comment.file,
-          body: `${lineRef} ${comment.body}`,
-          isFileLevel: true
-        };
-      }
-
-      console.log(`Formatting line comment: ${comment.file}:${comment.line_start}${isRange ? `-${comment.line_end}` : ''} side=${side}`);
-
-      const commentObj = {
-        path: comment.file,
-        line: isRange ? comment.line_end : comment.line_start,
-        body: comment.body,
-        side: side,
-        isFileLevel: false
-      };
-
-      if (isRange) {
-        commentObj.start_line = comment.line_start;
-      }
-
-      return commentObj;
-    });
+    // Headless --ai-draft / --ai-review submits through the same mapping.
+    const graphqlComments = buildReviewComments(comments, diffContent);
 
     // Submit review using GraphQL API (supports file-level comments)
     console.log(`${event === 'DRAFT' ? 'Creating draft review' : 'Submitting review'} for PR #${prNumber} with ${comments.length} comments`);
@@ -1667,31 +1611,17 @@ router.post('/api/pr/:owner/:repo/:number/submit-review', async (req, res) => {
 
     const prNodeId = prData.node_id ?? null;
 
-    // The PR head SHA is required by the host pending-review-comments path
-    // (GitHub-compatible alt-hosts validate each inline comment like
-    // `pulls.createReviewComment`, which mandates `commit_id`). The GraphQL
-    // path on github.com ignores it (the pending review pins the commit
-    // implicitly), so threading it through is harmless there.
-    // `prData.head_sha` is the canonical source (merged from the cached PR
-    // JSON); `prMetadata.head_sha` is a defensive fallback for callers whose
-    // record exposes it as a column. If neither is present, proceed without
-    // it but warn loudly so the resulting 422 is diagnosable.
-    const headSha = prData.head_sha || prMetadata.head_sha || null;
-    if (!headSha) {
-      logger.warn(
-        `Submit review for ${repository}#${prNumber}: PR head SHA is missing ` +
-        `(prData.head_sha and prMetadata.head_sha both absent). Host inline-comment ` +
-        `posting will likely fail with a 422 missing commit_id error.`
-      );
-    }
-
-    const submitPrContext = {
+    // Shared with headless --ai-draft / --ai-review (src/main.js): carries the
+    // draft's numeric review id and the PR head SHA that alt-hosts require as
+    // each inline comment's commit_id.
+    const submitPrContext = buildSubmitPrContext({
       owner,
       repo,
       prNumber,
-      reviewId: existingDraft?.databaseId,
-      headSha
-    };
+      existingDraft,
+      prData,
+      prMetadata
+    });
 
     if (event === 'DRAFT') {
       // Delegate to createDraftReviewGraphQL (handles both new and existing drafts)
