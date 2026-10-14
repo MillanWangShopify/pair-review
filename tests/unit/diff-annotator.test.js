@@ -1,6 +1,6 @@
 // Copyright 2026 Tim Perkins (tjwp) | SPDX-License-Identifier: Apache-2.0
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { execSync, execFileSync } from 'child_process';
+import { execSync, execFileSync, spawnSync } from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -147,6 +147,30 @@ describe('diff-annotator', () => {
   });
 
   describe('annotateDiff', () => {
+    it('labels files with decoded paths when git quoted the headers', () => {
+      const { QUOTEPATH_FALSE_DIFF, QUOTEPATH_TRUE_DIFF } = require('../utils/git-path-fixtures');
+
+      const current = annotateDiff(QUOTEPATH_FALSE_DIFF);
+      expect(current).toContain('=== quo"te.js ===');
+      expect(current).toContain('=== x b/y.js ===');
+      expect(current).toContain('=== a => b.md ===');
+      expect(current).toContain('=== lib/moved.js -> ñew dir/moved é.js ===');
+      expect(current).not.toContain('\t ===');
+
+      const cached = annotateDiff(QUOTEPATH_TRUE_DIFF);
+      expect(cached).toContain('=== src/café.js ===');
+      expect(cached).toContain('=== lib/moved.js -> ñew dir/moved é.js ===');
+      expect(cached).not.toContain('\\303');
+    });
+
+    it('labels a rename out of a path containing " b/" with its rename lines', () => {
+      const { B_SLASH_RENAME_DIFF } = require('../utils/git-path-fixtures');
+
+      const annotated = annotateDiff(B_SLASH_RENAME_DIFF);
+      expect(annotated).toContain('=== x b/y.js -> z.js ===');
+      expect(annotated).not.toContain('y.js b/z.js');
+    });
+
     it('should return empty string for empty input', () => {
       expect(annotateDiff('')).toBe('');
       expect(annotateDiff('   ')).toBe('');
@@ -986,6 +1010,154 @@ describe('git-diff-lines on a real repo with header-like hunk content', () => {
       expect(output).not.toMatch(/=== (old comment|x|y|\+x) ===/);
     });
   }
+});
+
+describe('git-diff-lines on a real repo with names git quotes', () => {
+  // Both scripts pin core.quotePath=false, so non-ASCII names come out
+  // verbatim, and decode the paths git still C-quotes (names with `"`, `\`
+  // or control characters). The AI reads file names from this output, so
+  // the awk port must name every file exactly like the Node CLI.
+  const projectRoot = path.resolve(__dirname, '../..');
+  const nodeScript = path.join(projectRoot, 'bin', 'git-diff-lines');
+  const pluginScript = path.join(projectRoot, 'plugin-code-critic', 'skills', 'analyze', 'scripts', 'git-diff-lines');
+  const EDITED = ['café.js', 'quo"te.js', 'back\\slash.js', 'dir with space/a b.js', 'x b/y.js', 'tab\tname.js', 'ctl\x01.js'];
+  let tempDir;
+  let repo;
+  let env;
+
+  beforeAll(() => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'git-diff-lines-quoted-'));
+    repo = path.join(tempDir, 'repo');
+    fs.mkdirSync(repo);
+    // Isolated HOME: git's default core.quotePath=true is in effect unless
+    // the scripts override it.
+    env = {
+      ...process.env,
+      HOME: tempDir,
+      XDG_CONFIG_HOME: tempDir,
+      GIT_CONFIG_NOSYSTEM: '1',
+      PAIR_REVIEW_NO_OPEN: '1'
+    };
+    const git = (...args) => execFileSync('git', args, { cwd: repo, env, stdio: 'pipe' });
+    const write = (name, content) => {
+      fs.mkdirSync(path.dirname(path.join(repo, name)), { recursive: true });
+      fs.writeFileSync(path.join(repo, name), content);
+    };
+    git('init', '-q');
+    git('config', 'user.email', 'test@test.com');
+    git('config', 'user.name', 'Test');
+    for (const name of EDITED) write(name, 'a\nb\n');
+    write('plain.js', 'a\nb\nc\nd\n');
+    write('gone"d.js', 'x\n');
+    write('bin"ary.png', Buffer.from([0, 1, 2, 3]));
+    git('add', '-A');
+    git('commit', '-q', '-m', 'initial');
+    for (const name of EDITED) write(name, 'a\nb\nc\n');
+    git('mv', 'plain.js', 'ré"named.js');
+    write('ré"named.js', 'a\nb\nc\nd\ne\n');
+    fs.rmSync(path.join(repo, 'gone"d.js'));
+    write('bin"ary.png', Buffer.from([0, 1, 2, 4]));
+    git('add', '-A');
+  });
+
+  afterAll(() => {
+    if (tempDir) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  const runNode = () => execFileSync('node', [nodeScript, '--cwd', repo, '--cached'], { encoding: 'utf8', env });
+  const runPlugin = () => execFileSync('bash', [pluginScript, '--cwd', repo, '--cached'], { encoding: 'utf8', env });
+  const fileHeaders = output => output.split('\n').filter(line => line.startsWith('=== '));
+
+  it('bin/git-diff-lines names every file by its real path', () => {
+    expect(fileHeaders(runNode())).toEqual([
+      '=== back\\slash.js ===',
+      '=== bin"ary.png ===',
+      '=== café.js ===',
+      '=== ctl\x01.js ===',
+      '=== dir with space/a b.js ===',
+      '=== gone"d.js ===',
+      '=== quo"te.js ===',
+      '=== plain.js -> ré"named.js ===',
+      '=== tab\tname.js ===',
+      '=== x b/y.js ==='
+    ]);
+  });
+
+  it('the plugin git-diff-lines produces the same output as bin/git-diff-lines', () => {
+    expect(runPlugin()).toBe(runNode());
+  });
+});
+
+describe('git-diff-lines on a real repo with a file name that is not UTF-8', () => {
+  // With core.quotePath=false a raw 0xFF byte in a file name reaches awk
+  // unescaped. BSD awk (macOS /usr/bin/awk) in a UTF-8 locale aborts on it
+  // with "towc: multibyte conversion failure" unless the plugin script runs
+  // awk under LC_ALL=C. APFS rejects such names on disk, so the commits are
+  // built with git plumbing and diffed commit to commit, never checked out.
+  const projectRoot = path.resolve(__dirname, '../..');
+  const pluginScript = path.join(projectRoot, 'plugin-code-critic', 'skills', 'analyze', 'scripts', 'git-diff-lines');
+  const BAD_NAME = Buffer.from([0x62, 0x61, 0x64, 0xff, 0x2e, 0x6a, 0x73]); // "bad\xff.js"
+  let tempDir;
+  let repo;
+  let env;
+  let oldCommit;
+  let newCommit;
+  let skipReason = null;
+
+  beforeAll(() => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'git-diff-lines-nonutf8-'));
+    repo = path.join(tempDir, 'repo');
+    fs.mkdirSync(repo);
+    // A UTF-8 locale is what makes awk decode the name; isolated HOME keeps
+    // the developer's git config out of the diff.
+    env = {
+      ...process.env,
+      HOME: tempDir,
+      XDG_CONFIG_HOME: tempDir,
+      GIT_CONFIG_NOSYSTEM: '1',
+      LC_ALL: 'en_US.UTF-8',
+      PAIR_REVIEW_NO_OPEN: '1'
+    };
+    const git = (args, input) => execFileSync('git', args, { cwd: repo, env, input, encoding: 'utf8', stdio: 'pipe' }).trim();
+    git(['init', '-q']);
+    git(['config', 'user.email', 'test@test.com']);
+    git(['config', 'user.name', 'Test']);
+    // argv strings are UTF-8 encoded, so the raw byte goes in through a
+    // NUL-terminated --index-info record on stdin.
+    const stage = content => {
+      const blob = git(['hash-object', '-w', '--stdin'], content);
+      const record = Buffer.concat([Buffer.from(`100644 ${blob}\t`), BAD_NAME, Buffer.from([0])]);
+      git(['update-index', '-z', '--add', '--index-info'], record);
+      return git(['write-tree']);
+    };
+    try {
+      oldCommit = git(['commit-tree', stage('a\nb\n'), '-m', 'initial']);
+      newCommit = git(['commit-tree', stage('a\nb\nc\n'), '-p', oldCommit, '-m', 'add c']);
+    } catch (error) {
+      skipReason = `git refused a non-UTF-8 path on this platform: ${error.message}`;
+    }
+  });
+
+  afterAll(() => {
+    if (tempDir) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('the plugin git-diff-lines annotates the file instead of crashing awk', (ctx) => {
+    if (skipReason) ctx.skip(skipReason);
+    const result = spawnSync('bash', [pluginScript, '--cwd', repo, oldCommit, newCommit], { env });
+    expect(result.stderr.toString()).toBe('');
+    expect(result.status).toBe(0);
+    // latin1 maps each byte to one char, so 0xFF survives as \xff
+    expect(result.stdout.toString('latin1')).toBe([
+      '=== bad\xff.js ===',
+      ' OLD | NEW |',
+      '@@ -1,2 +1,3 @@',
+      '   1 |    1 |     a',
+      '   2 |    2 |     b',
+      '  -- |    3 | [+] c',
+      ''
+    ].join('\n'));
+  });
 });
 
 describe('git-diff-lines CLI', () => {

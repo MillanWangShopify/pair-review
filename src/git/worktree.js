@@ -6,8 +6,10 @@ const os = require('os');
 const { getConfigDir, DEFAULT_CHECKOUT_TIMEOUT_MS } = require('../config');
 const { WorktreeRepository, generateWorktreeId } = require('../database');
 const { getGeneratedFilePatterns } = require('./gitattributes');
-const { normalizeRepository, resolveRenamedFile, resolveRenamedFileOld } = require('../utils/paths');
-const { GIT_DIFF_FLAGS_ARRAY, GIT_DIFF_SUMMARY_FLAGS_ARRAY } = require('./diff-flags');
+const { normalizeRepository } = require('../utils/paths');
+const { buildChangedFileEntries } = require('../utils/diff-file-list');
+const { decodeGitPath } = require('../utils/git-paths');
+const { GIT_DIFF_FLAGS_ARRAY, SIMPLE_GIT_PATH_OPTIONS } = require('./diff-flags');
 const { rawFetchNoTags, fetchWithPruneRecovery } = require('./fetch-helpers');
 const { spawn, execSync } = require('child_process');
 
@@ -39,7 +41,7 @@ class GitWorktreeManager {
    * @returns {import('simple-git').SimpleGit}
    */
   _gitFor(dirPath) {
-    return simpleGit(dirPath);
+    return simpleGit(dirPath, SIMPLE_GIT_PATH_OPTIONS);
   }
 
   /**
@@ -873,48 +875,21 @@ class GitWorktreeManager {
   }
 
   /**
-   * Get list of changed files in the PR
-   * @param {string} worktreePath - Path to worktree
-   * @param {Object} prData - PR data from GitHub API
+   * Get list of changed files in the PR, built from its unified diff.
+   *
+   * The diff is the one source of PR paths: renames come from its explicit
+   * `rename from` / `rename to` lines and counts from its hunks, so
+   * changed_files spells every file exactly like the diff headers the
+   * browser keys on (see buildChangedFileEntries).
+   *
+   * @param {string} worktreePath - Path to worktree (for .gitattributes)
+   * @param {string} diff - Unified diff from generateUnifiedDiff
    * @returns {Promise<Array>} Array of changed file information
    */
-  async getChangedFiles(worktreePath, prData) {
+  async getChangedFiles(worktreePath, diff) {
     try {
-      const git = this._gitFor(worktreePath);
-      const baseSha = this.getPRBaseSha(prData);
-      const headSha = this.getPRHeadSha(prData);
-
-      await this.assertCommitAvailableLocally(git, baseSha, 'Base SHA');
-      await this.assertCommitAvailableLocally(git, headSha, 'Head SHA');
-
-      // Get file changes with stats using base SHA and head SHA
-      // This ensures we get the exact files changed in the PR, even if the base branch has moved
-      const diffSummary = await git.diffSummary([
-        `${baseSha}...${headSha}`,
-        ...GIT_DIFF_SUMMARY_FLAGS_ARRAY
-      ]);
-
-      // Parse .gitattributes to identify generated files
       const gitattributes = await getGeneratedFilePatterns(worktreePath);
-
-      return diffSummary.files.map(file => {
-        const resolvedFile = resolveRenamedFile(file.file);
-        const isRenamed = resolvedFile !== file.file;
-        const result = {
-          file: resolvedFile,
-          insertions: file.insertions,
-          deletions: file.deletions,
-          changes: file.changes,
-          binary: file.binary || false,
-          generated: gitattributes.isGenerated(resolvedFile)
-        };
-        if (isRenamed) {
-          result.renamed = true;
-          result.renamedFrom = resolveRenamedFileOld(file.file);
-        }
-        return result;
-      });
-
+      return buildChangedFileEntries(diff, gitattributes);
     } catch (error) {
       console.error('Error getting changed files:', error);
       throw this.wrapError('Failed to get changed files', error);
@@ -1449,9 +1424,12 @@ class GitWorktreeManager {
    */
   async getSparseCheckoutPatterns(repoPath) {
     try {
-      const git = simpleGit(repoPath);
+      // `sparse-checkout list` C-quotes names like a diff header does:
+      // core.quotePath=false keeps non-ASCII verbatim, and decodeGitPath
+      // undoes the quoting git still applies to `"`, `\` and control chars.
+      const git = this._gitFor(repoPath);
       const output = await git.raw(['sparse-checkout', 'list']);
-      return output.trim().split('\n').filter(Boolean);
+      return output.split('\n').filter(Boolean).map(decodeGitPath);
     } catch {
       return [];
     }

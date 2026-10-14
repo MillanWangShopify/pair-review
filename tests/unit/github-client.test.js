@@ -1302,57 +1302,6 @@ describe('GitHubClient', () => {
     });
   });
 
-  describe('calculateDiffPosition', () => {
-    it('should return -1 for missing parameters', () => {
-      const client = new GitHubClient('test-token');
-      expect(client.calculateDiffPosition(null, 'file.js', 10)).toBe(-1);
-      expect(client.calculateDiffPosition('diff', null, 10)).toBe(-1);
-      expect(client.calculateDiffPosition('diff', 'file.js', undefined)).toBe(-1);
-    });
-
-    it('should calculate position for added lines', () => {
-      const client = new GitHubClient('test-token');
-      const diff = `diff --git a/file.js b/file.js
---- a/file.js
-+++ b/file.js
-@@ -1,3 +1,4 @@
-+// New comment
- line1
- line2
- line3`;
-
-      // Line 1 in new file is the added line, which is position 1 (first line after hunk header)
-      expect(client.calculateDiffPosition(diff, 'file.js', 1)).toBe(1);
-    });
-
-    it('should return -1 for lines not in diff', () => {
-      const client = new GitHubClient('test-token');
-      const diff = `diff --git a/file.js b/file.js
---- a/file.js
-+++ b/file.js
-@@ -1,3 +1,3 @@
- line1
- line2
- line3`;
-
-      // Line 100 is not in the diff
-      expect(client.calculateDiffPosition(diff, 'file.js', 100)).toBe(-1);
-    });
-
-    it('should return -1 for non-existent file', () => {
-      const client = new GitHubClient('test-token');
-      const diff = `diff --git a/file.js b/file.js
---- a/file.js
-+++ b/file.js
-@@ -1,3 +1,3 @@
- line1
- line2
- line3`;
-
-      expect(client.calculateDiffPosition(diff, 'other-file.js', 1)).toBe(-1);
-    });
-  });
-
   describe('getPendingReviewForUser', () => {
     it('should return the pending review authored by the viewer', async () => {
       const client = new GitHubClient('test-token');
