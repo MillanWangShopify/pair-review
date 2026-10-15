@@ -7,8 +7,8 @@ import { test, expect } from './fixtures.js';
 import { waitForDiffToRender, dragResizeHandle } from './helpers.js';
 
 const MODES = [
-  { name: 'PR Mode', url: '/pr/test-owner/test-repo/1', prKey: 'test-owner/test-repo#1' },
-  { name: 'Local Mode', url: '/local/2', prKey: 'local/local#2' },
+  { name: 'PR Mode', url: '/pr/test-owner/test-repo/1', prKey: 'test-owner/test-repo#1', reviewId: 1 },
+  { name: 'Local Mode', url: '/local/2', prKey: 'local/local#2', reviewId: 2 },
 ];
 
 // Below the 900px (panel group) and 1200px (file navigator) breakpoints
@@ -43,10 +43,6 @@ function isTopmostAtCenter(locator) {
 /** Poll an element's rendered width (panels animate their width open/closed). */
 function pollWidth(locator) {
   return expect.poll(() => box(locator).then((b) => b.width));
-}
-
-function hasOverlayClass(page) {
-  return page.locator('#right-panel-group').evaluate((el) => el.classList.contains('right-panel-group--overlay'));
 }
 
 /** Turn guided tours on and serve a fixed tour (mirrors tour.spec.js mocks). */
@@ -86,6 +82,63 @@ async function mockTour(page) {
     contentType: 'application/json',
     body: JSON.stringify({ summaries: [], generating: false }),
   }));
+}
+
+/**
+ * Insert AI findings straight into the worker's DB (as bulk-actions.spec does), so the
+ * Review panel has real finding rows with quick actions. Returns a cleanup function.
+ */
+const SEEDED = 'Slim-screen finding:';
+
+function seedFindings(db, reviewId) {
+  const runId = `slim-screen-run-${reviewId}-${Date.now()}`;
+  const now = new Date().toISOString();
+  const insert = db.prepare(`
+    INSERT INTO comments (review_id, source, ai_run_id, ai_level, file, line_start, line_end,
+      type, title, body, status, created_at, updated_at)
+    VALUES (?, 'ai', ?, NULL, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
+  `);
+  [
+    ['src/utils.js', 3, 'improvement', `${SEEDED} consider extracting this computation into a well named helper`],
+    ['src/utils.js', 5, 'bug', `${SEEDED} possible null dereference when the upstream value is missing`],
+    ['src/main.js', 12, 'praise', `${SEEDED} nice use of a small tagged logging helper for diagnostics`],
+  ].forEach(([file, line, type, title]) => {
+    insert.run(reviewId, runId, file, line, line, type, title, `${title}.`, now, now);
+  });
+  return () => db.prepare('DELETE FROM comments WHERE ai_run_id = ?').run(runId);
+}
+
+/** The seeded findings' rows (other tests in the worker may leave their own findings). */
+function seededFindingRows(page) {
+  return page.locator('#ai-panel .finding-item-wrapper', { hasText: SEEDED });
+}
+
+/** Load the seeded findings into the Review panel (works in PR and Local mode). */
+async function loadFindings(page) {
+  await page.evaluate(() => window.prManager.loadAISuggestions());
+  await expect(seededFindingRows(page)).toHaveCount(3);
+}
+
+/** Buttons in the Review panel that render outside it (the segment row scrolls inside its own clip). */
+function spilledReviewControls(page) {
+  return page.locator('#ai-panel').evaluate((panel) => {
+    const p = panel.getBoundingClientRect();
+    return [...panel.querySelectorAll('button, .findings-header-actions, .finding-quick-actions, .finding-chat-action')]
+      .filter((el) => !el.closest('.segment-control-scroll, .resize-handle'))
+      .filter((el) => {
+        const b = el.getBoundingClientRect();
+        return b.width > 0 && (b.right > p.right + 1 || b.left < p.left - 1);
+      })
+      .map((el) => el.className || el.tagName);
+  });
+}
+
+/** Persisted panel preferences that a viewport-driven display state must never write. */
+const PREF_KEYS = ['panel-group-layout', 'panel-group-last-h', 'panel-group-last-v', 'panel-group-v-ratio',
+  'ai-panel-width', 'chat-panel-width', 'sidebar-width', 'file-sidebar-collapsed'];
+
+function prefsSnapshot(page) {
+  return page.evaluate((keys) => Object.fromEntries(keys.map((k) => [k, localStorage.getItem(k)])), PREF_KEYS);
 }
 
 function rootVar(page, name) {
@@ -131,9 +184,9 @@ for (const mode of MODES) {
         expect(panel.top).toBeGreaterThanOrEqual((await box(toolbar)).bottom - 1);
         // Floats over the diff rather than displacing it
         expect((await box(diffView)).width).toBe(widthBefore);
-        expect(await isTopmostAtCenter(page.locator('.ai-panel-header'))).toBe(true);
+        await expect.poll(() => isTopmostAtCenter(page.locator('.ai-panel-header'))).toBe(true);
         // Inline-comment width calcs must not reserve space for the drawer
-        expect(await rootVar(page, '--right-panel-group-width')).toBe('0px');
+        await expect.poll(() => rootVar(page, '--right-panel-group-width')).toBe('0px');
       });
 
       test('review toggle stays usable while open and closes the drawer', async ({ page }) => {
@@ -144,7 +197,7 @@ for (const mode of MODES) {
         await expect(aiPanel).not.toHaveClass(/collapsed/);
         await pollWidth(aiPanel).toBeGreaterThan(200);
         await expect(toggle).toBeVisible();
-        expect(await isTopmostAtCenter(toggle)).toBe(true);
+        await expect.poll(() => isTopmostAtCenter(toggle)).toBe(true);
 
         await toggle.click();
         await expect(aiPanel).toHaveClass(/collapsed/);
@@ -172,11 +225,11 @@ for (const mode of MODES) {
         await pollWidth(chatPanel).toBeGreaterThan(200);
         const panel = await box(chatPanel);
         expect(panel.right).toBeLessThanOrEqual(SLIM.width + 1);
-        expect(await isTopmostAtCenter(page.locator('.chat-panel__header'))).toBe(true);
+        await expect.poll(() => isTopmostAtCenter(page.locator('.chat-panel__header'))).toBe(true);
 
         // The toggle stays reachable (not under the drawer) and closes it again
         await expect(chatBtn).toHaveClass(/active/);
-        expect(await isTopmostAtCenter(chatBtn)).toBe(true);
+        await expect.poll(() => isTopmostAtCenter(chatBtn)).toBe(true);
         await chatBtn.click();
         await expect(chatPanel).not.toBeVisible();
       });
@@ -201,11 +254,18 @@ for (const mode of MODES) {
     });
 
     test.describe('Review and Chat together on ultra-slim screens', () => {
+      let cleanupFindings;
+      test.beforeEach(async ({ testServer }) => {
+        cleanupFindings = seedFindings(testServer.db, mode.reviewId);
+      });
+      test.afterEach(() => cleanupFindings?.());
+
       test('stack instead of squeezing side by side, and the layout picker matches', async ({ page }) => {
         await page.setViewportSize({ width: 375, height: 800 });
         await page.reload();
         await waitForDiffToRender(page);
         await enableChat(page);
+        await loadFindings(page);
         await page.locator('#ai-panel-toggle').click();
         await page.locator('#chat-toggle-btn').click();
 
@@ -216,19 +276,12 @@ for (const mode of MODES) {
         await pollWidth(aiPanel).toBeGreaterThan(300);
         await pollWidth(chatPanel).toBeGreaterThan(300);
         expect((await box(chatPanel)).top).toBeGreaterThanOrEqual((await box(aiPanel)).bottom - 1);
+        // A forced stack offers no group resize handle (it would overwrite the saved widths)
+        await expect(group.locator('.panel-group-resize-handle')).toBeHidden();
 
-        // No Review control spills past the panel (the segment row scrolls inside its own clip)
-        const spilled = await aiPanel.evaluate((panel) => {
-          const p = panel.getBoundingClientRect();
-          return [...panel.querySelectorAll('button, .findings-header-actions')]
-            .filter((el) => !el.closest('.segment-control-scroll, .resize-handle'))
-            .filter((el) => {
-              const b = el.getBoundingClientRect();
-              return b.width > 0 && (b.right > p.right + 1 || b.left < p.left - 1);
-            })
-            .map((el) => el.className || el.tagName);
-        });
-        expect(spilled).toEqual([]);
+        // No Review control spills past the panel, including a hovered finding's quick actions
+        await seededFindingRows(page).first().hover();
+        expect(await spilledReviewControls(page)).toEqual([]);
         // The user's saved layout is not overwritten
         expect(await page.evaluate(() => localStorage.getItem('panel-group-layout'))).toBeNull();
 
@@ -255,6 +308,87 @@ for (const mode of MODES) {
         await expect(thumb('h-review-chat')).toHaveClass(/layout-popover__thumb--active/);
         await expect(thumb('h-chat-review')).toBeVisible();
       });
+
+      test('keep every Review control inside the panel while side by side', async ({ page }) => {
+        await page.setViewportSize({ width: 600, height: 800 });
+        await page.reload();
+        await waitForDiffToRender(page);
+        await enableChat(page);
+        await loadFindings(page);
+        await page.locator('#ai-panel-toggle').click();
+        await page.locator('#chat-toggle-btn').click();
+
+        // 600px still fits both side by side at their minimum widths
+        await expect(page.locator('#right-panel-group')).toHaveClass(/layout-h-review-chat/);
+        await pollWidth(page.locator('#ai-panel')).toBeGreaterThanOrEqual(200);
+        for (const wrapper of await seededFindingRows(page).all()) {
+          await wrapper.hover();
+          expect(await spilledReviewControls(page)).toEqual([]);
+        }
+      });
+    });
+
+    test.describe('Fits the viewport height', () => {
+      for (const size of [{ width: 375, height: 700 }, { width: 700, height: 600 }]) {
+        test(`drawers and the Chat input end inside a ${size.width}x${size.height} viewport`, async ({ page }) => {
+          await page.setViewportSize(size);
+          await page.reload();
+          await waitForDiffToRender(page);
+          await enableChat(page);
+          await page.locator('#chat-toggle-btn').click();
+          await expect(page.locator('.chat-panel')).toBeVisible();
+          await page.locator('#sidebar-toggle-collapsed').click();
+          await expect(page.locator('#files-sidebar')).toBeVisible();
+
+          // A legacy <=768px page padding used to push everything 16px past the bottom
+          for (const selector of ['.main-layout', '.diff-view', '#right-panel-group', '#files-sidebar', '.chat-panel__input-area']) {
+            expect((await box(page.locator(selector))).bottom, selector).toBeLessThanOrEqual(size.height + 0.5);
+          }
+        });
+      }
+    });
+
+    test.describe('Viewport-driven display states', () => {
+      test('never write the saved panel preferences', async ({ page }) => {
+        // Saved preferences from a wide-screen session
+        await page.evaluate(() => {
+          localStorage.setItem('panel-group-layout', 'h-review-chat');
+          localStorage.setItem('ai-panel-width', '330');
+          localStorage.setItem('chat-panel-width', '410');
+          localStorage.setItem('panel-group-v-ratio', '0.6000');
+          localStorage.setItem('file-sidebar-collapsed', 'false');
+        });
+        await page.setViewportSize({ width: 1500, height: 800 });
+        await page.reload();
+        await waitForDiffToRender(page);
+        await enableChat(page);
+        await page.locator('#ai-panel-toggle').click();
+        await page.locator('#chat-toggle-btn').click();
+        await expect(page.locator('.chat-panel')).toBeVisible();
+        const before = await prefsSnapshot(page);
+
+        // Docked -> floating -> forced stack and back, opening the file navigator drawer
+        // and closing/reopening a panel along the way
+        for (const width of [1100, 950, 850, 600, 375]) {
+          await page.setViewportSize({ width, height: 800 });
+          if (width === 1100 || width === 375) {
+            await page.locator('#sidebar-toggle-collapsed').click();
+            await expect(page.locator('#files-sidebar')).toHaveClass(/sidebar--overlay-open/);
+            await page.locator('#sidebar-toggle-collapsed').click();
+          }
+        }
+        await expect(page.locator('#right-panel-group')).toHaveClass(/right-panel-group--forced-stack/);
+        await page.locator('.chat-panel__close-btn').click();
+        await page.locator('#chat-toggle-btn').click();
+        await expect(page.locator('.chat-panel')).toBeVisible();
+        await page.setViewportSize({ width: 1500, height: 800 });
+
+        await expect(page.locator('#right-panel-group')).toHaveClass(/layout-h-review-chat/);
+        await expect(page.locator('#right-panel-group')).not.toHaveClass(/right-panel-group--forced-stack/);
+        expect(await prefsSnapshot(page)).toEqual(before);
+        await expect.poll(() => rootVar(page, '--ai-panel-width')).toBe('330px');
+        await expect.poll(() => rootVar(page, '--chat-panel-width')).toBe('410px');
+      });
     });
 
     test.describe('File navigator drawer below 1200px', () => {
@@ -271,7 +405,7 @@ for (const mode of MODES) {
 
         await expect(sidebar).not.toBeVisible();
         await expect(toggle).toBeVisible();
-        expect(await rootVar(page, '--sidebar-width')).toBe('0px');
+        await expect.poll(() => rootVar(page, '--sidebar-width')).toBe('0px');
 
         await toggle.click();
         await expect(sidebar).toBeVisible();
@@ -281,7 +415,7 @@ for (const mode of MODES) {
         expect(drawer.left).toBeGreaterThanOrEqual(-1);
         expect(drawer.width).toBeGreaterThan(200);
         expect(drawer.top).toBeGreaterThanOrEqual((await box(toolbar)).bottom - 1);
-        expect(await isTopmostAtCenter(page.locator('#files-sidebar .sidebar-header'))).toBe(true);
+        await expect.poll(() => isTopmostAtCenter(page.locator('#files-sidebar .sidebar-header'))).toBe(true);
 
         // Toolbar toggle closes it again
         await toggle.click();
@@ -354,6 +488,22 @@ for (const mode of MODES) {
         await expect(sidebar).not.toBeVisible();
       });
 
+      test('the toggle works even when there are no changed files', async ({ page }) => {
+        test.skip(mode.name !== 'Local Mode', 'Local mode empties the file list on a clean working tree');
+        await page.route('**/api/local/*/diff*', (route) => route.fulfill({
+          contentType: 'application/json',
+          body: JSON.stringify({ diff: '', stats: {}, generated_files: [] }),
+        }));
+        await page.reload();
+        await expect(page.locator('#file-list')).toContainText('No files changed');
+
+        const sidebar = page.locator('#files-sidebar');
+        await page.locator('#sidebar-toggle-collapsed').click();
+        await expect(sidebar).toHaveClass(/sidebar--overlay-open/);
+        await expect(sidebar).toBeVisible();
+        await expect.poll(() => rootVar(page, '--sidebar-width')).toBe('0px');
+      });
+
       test('Review panel stays docked beside the diff between 900px and 1200px', async ({ page }) => {
         const aiPanel = page.locator('#ai-panel');
         await page.locator('#ai-panel-toggle').click();
@@ -363,6 +513,25 @@ for (const mode of MODES) {
           const diff = await box(page.locator('.diff-view'));
           return Math.abs(diff.right - (await box(aiPanel)).left);
         }).toBeLessThanOrEqual(1);
+      });
+    });
+
+    test.describe('Collapsed drawer', () => {
+      test('a vertical layout with both panels closed leaves no box over the diff', async ({ page }) => {
+        await page.evaluate(() => localStorage.setItem('panel-group-layout', 'v-review-chat'));
+        await page.setViewportSize(SLIM);
+        await page.reload();
+        await waitForDiffToRender(page);
+
+        const group = page.locator('#right-panel-group');
+        await expect(group).toHaveClass(/group-collapsed/);
+        await expect(group).toHaveClass(/layout-v-review-chat/);
+        // Stale non-zero widths must not resurrect the box (layout-v-* sets width: max(...))
+        await page.evaluate(() => {
+          document.documentElement.style.setProperty('--ai-panel-width', '320px');
+          document.documentElement.style.setProperty('--chat-panel-width', '400px');
+        });
+        await expect.poll(() => box(group).then((b) => b.width)).toBe(0);
       });
     });
 
@@ -396,6 +565,21 @@ for (const mode of MODES) {
 
         await pollWidth(chatPanel).toBeGreaterThan(before + 30);
       });
+
+      test('clicking the Chat edge while it shares the drawer keeps its saved width', async ({ page }) => {
+        await enableChat(page);
+        await page.locator('#ai-panel-toggle').click();
+        await page.locator('#chat-toggle-btn').click();
+        // Side by side at 600px: Chat renders narrower than its 400px width variable
+        await expect(page.locator('#right-panel-group')).toHaveClass(/layout-h-review-chat/);
+        await expect.poll(() => box(page.locator('.chat-panel')).then((b) => b.width)).toBeLessThan(390);
+
+        await dragResizeHandle(page, page.locator('.chat-panel__resize-handle'), 0);
+
+        // Used to save the shrunk box width, ratcheting the user's width down
+        expect(await page.evaluate(() => localStorage.getItem('chat-panel-width'))).toBe('400');
+        await expect.poll(() => rootVar(page, '--chat-panel-width')).toBe('400px');
+      });
     });
 
     test.describe('Docking above 900px depends on the room left for the diff', () => {
@@ -411,13 +595,13 @@ for (const mode of MODES) {
         await page.locator('#chat-toggle-btn').click();
         await pollWidth(page.locator('.chat-panel')).toBeGreaterThan(300);
 
-        expect(await hasOverlayClass(page)).toBe(true);
+        await expect(page.locator('#right-panel-group')).toHaveClass(/right-panel-group--overlay/);
         // The diff keeps the full width underneath the drawer
         expect((await box(page.locator('.diff-view'))).width).toBeGreaterThan(940);
-        expect(await rootVar(page, '--right-panel-group-width')).toBe('0px');
+        await expect.poll(() => rootVar(page, '--right-panel-group-width')).toBe('0px');
         // ...and the toggles stay reachable to close the drawer
-        expect(await isTopmostAtCenter(page.locator('#ai-panel-toggle'))).toBe(true);
-        expect(await isTopmostAtCenter(page.locator('#chat-toggle-btn'))).toBe(true);
+        await expect.poll(() => isTopmostAtCenter(page.locator('#ai-panel-toggle'))).toBe(true);
+        await expect.poll(() => isTopmostAtCenter(page.locator('#chat-toggle-btn'))).toBe(true);
       });
 
       test('the Review panel alone still docks', async ({ page }) => {
@@ -425,7 +609,7 @@ for (const mode of MODES) {
         await page.locator('#ai-panel-toggle').click();
         await pollWidth(aiPanel).toBeGreaterThan(200);
 
-        expect(await hasOverlayClass(page)).toBe(false);
+        await expect(page.locator('#right-panel-group')).not.toHaveClass(/right-panel-group--overlay/);
         // Docked: the diff ends where the panel begins (poll — width animates)
         await expect.poll(async () => {
           const diff = await box(page.locator('.diff-view'));
@@ -441,23 +625,23 @@ for (const mode of MODES) {
 
         // Just above the old cliff, docking would leave the diff ~181px
         await page.setViewportSize({ width: 901, height: 800 });
-        await expect.poll(() => hasOverlayClass(page)).toBe(true);
+        await expect(page.locator('#right-panel-group')).toHaveClass(/right-panel-group--overlay/);
         await expect.poll(() => box(page.locator('.diff-view')).then((b) => b.width)).toBeGreaterThan(890);
       });
 
       test('the panels re-dock once there is room again', async ({ page }) => {
         await page.locator('#ai-panel-toggle').click();
         await page.locator('#chat-toggle-btn').click();
-        await expect.poll(() => hasOverlayClass(page)).toBe(true);
+        await expect(page.locator('#right-panel-group')).toHaveClass(/right-panel-group--overlay/);
 
         await page.setViewportSize({ width: 1500, height: 800 });
-        await expect.poll(() => hasOverlayClass(page)).toBe(false);
+        await expect(page.locator('#right-panel-group')).not.toHaveClass(/right-panel-group--overlay/);
         await expect.poll(async () => {
           const group = await box(page.locator('#right-panel-group'));
           const diff = await box(page.locator('.diff-view'));
           return Math.abs(diff.right - group.left);
         }).toBeLessThanOrEqual(1);
-        expect(await rootVar(page, '--right-panel-group-width')).not.toBe('0px');
+        await expect.poll(() => rootVar(page, '--right-panel-group-width')).not.toBe('0px');
       });
     });
 
@@ -472,7 +656,7 @@ for (const mode of MODES) {
         await expect(tourBar).toBeVisible();
 
         // Narrow enough that the bar's contents wrap past the nominal 56px
-        await page.setViewportSize({ width: 375, height: 800 });
+        await page.setViewportSize({ width: 320, height: 800 });
         await expect.poll(() => box(tourBar).then((b) => b.bottom - b.top)).toBeGreaterThan(56);
 
         await page.locator('#sidebar-toggle-collapsed').click();
@@ -527,7 +711,7 @@ for (const mode of MODES) {
         await page.locator('#chat-toggle-btn').click();
         await pollWidth(page.locator('.chat-panel')).toBeGreaterThan(300);
 
-        expect(await hasOverlayClass(page)).toBe(false);
+        await expect(page.locator('#right-panel-group')).not.toHaveClass(/right-panel-group--overlay/);
         await expect.poll(async () => {
           const sidebar = await box(page.locator('#files-sidebar'));
           const diff = await box(page.locator('.diff-view'));

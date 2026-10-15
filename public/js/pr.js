@@ -413,6 +413,10 @@ class PRManager {
     // Track toolbar height for sticky file headers (they sit below the sticky toolbar)
     this._initToolbarHeightTracking();
 
+    // Wire the file navigator toggles once; the sidebar markup is static, so
+    // this must not wait for (or depend on) a non-empty file list
+    this.setupSidebarToggle();
+
     // Initialize diff options dropdown (gear icon for whitespace toggle).
     // Must happen before init() so the persisted hideWhitespace state is
     // applied before the first loadAndDisplayFiles() call.
@@ -7730,8 +7734,6 @@ class PRManager {
       const groupElement = this.renderFileGroup(dirPath, dirFiles);
       fileListContainer.appendChild(groupElement);
     }
-
-    this.setupSidebarToggle();
   }
 
   renderFileGroup(dirPath, files) {
@@ -7903,12 +7905,6 @@ class PRManager {
       sidebar.classList.add('collapsed');
     }
     syncSidebarWidth();
-
-    // updateFileList() re-runs this whenever the file list changes; bind the
-    // listeners only once. (The overlay toggle below is not idempotent, so
-    // stacked listeners would cancel each other out.)
-    if (sidebar.dataset.listenerAttached) return;
-    sidebar.dataset.listenerAttached = 'true';
 
     // The drawer state is transient so it never overwrites the persisted
     // docked (wide-screen) collapsed state.

@@ -18,3 +18,5 @@ Fix the Review, Chat and file navigator panels being unreachable on slim screens
   The size limit no longer reserves room for the hidden navigator.
 - The toolbar no longer overlaps the guided-tour bar when the bar's text wraps on narrow
   screens.
+- At 768px and narrower the page no longer runs 16px past the bottom of the window, which
+  cut off the bottom of the diff and of the panels, including the Chat input.

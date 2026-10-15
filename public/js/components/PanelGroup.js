@@ -177,6 +177,8 @@ class PanelGroup {
    */
   _syncLayoutClass(stack = false) {
     if (!this.groupEl) return;
+    // Before the early return: a chosen v-* layout and a forced stack share a class
+    this.groupEl.classList.toggle('right-panel-group--forced-stack', stack);
     const effective = stack ? this._layout.replace(/^h-/, 'v-') : this._layout;
     if (effective === this._effectiveLayout) return;
 

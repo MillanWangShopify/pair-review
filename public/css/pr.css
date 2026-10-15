@@ -1824,10 +1824,6 @@ body:not(.tour-active) #diff-container [data-annotation-slot] {
     display: flex !important;
   }
 
-  #pr-container {
-    padding: 16px;
-  }
-  
   .pr-header {
     flex-direction: column;
     align-items: stretch;
@@ -7287,12 +7283,6 @@ body.resizing * {
   display: contents;
 }
 
-/* When both panels are hidden */
-.right-panel-group.group-collapsed {
-  width: 0;
-  overflow: hidden;
-}
-
 /* Horizontal layouts */
 .right-panel-group.layout-h-review-chat { flex-direction: row; }
 .right-panel-group.layout-h-review-chat .ai-panel { order: 1; }
@@ -7308,6 +7298,13 @@ body.resizing * {
 .right-panel-group.layout-v-chat-review {
   flex-direction: column;
   width: max(var(--ai-panel-width), var(--chat-panel-width));
+}
+
+/* When both panels are hidden. Must follow the vertical layout rules above:
+   same specificity, so a later width there would win and leave an empty box. */
+.right-panel-group.group-collapsed {
+  width: 0;
+  overflow: hidden;
 }
 
 .right-panel-group.layout-v-review-chat .ai-panel { order: 0; }
@@ -9812,6 +9809,12 @@ body.tour-active {
 
 [data-theme="dark"] .right-panel-group--overlay:not(.group-collapsed) {
   box-shadow: -8px 0 24px rgba(0, 0, 0, 0.45);
+}
+
+/* A forced stack is a temporary display state: resizing it would overwrite the
+   saved side-by-side widths (the group handle sets both panels to one width) */
+.right-panel-group.right-panel-group--forced-stack .panel-group-resize-handle {
+  display: none;
 }
 
 /* Side-by-side panels shrink to share the drawer instead of overflowing */

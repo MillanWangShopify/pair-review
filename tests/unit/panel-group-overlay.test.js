@@ -186,6 +186,18 @@ describe('PanelGroup._updateRightPanelGroupWidth', () => {
     expect(layoutClass()).toBe('layout-h-review-chat');
   });
 
+  it('marks a forced stack, but not a chosen vertical layout, so its resize handle can hide', () => {
+    const forced = () => group.groupEl.classList.contains('right-panel-group--forced-stack');
+    makePanelGroup({ layoutWidth: 360, slim: true })._updateRightPanelGroupWidth();
+    expect(layoutClass()).toBe('layout-v-review-chat');
+    expect(forced()).toBe(true);
+    // Choosing the same vertical layout keeps the applied class (early return), yet is no longer forced
+    group._layout = 'v-review-chat';
+    group._updateRightPanelGroupWidth();
+    expect(layoutClass()).toBe('layout-v-review-chat');
+    expect(forced()).toBe(false);
+  });
+
   it('goes back to side by side once the drawer is wide enough', () => {
     makePanelGroup({ layoutWidth: 360, slim: true })._updateRightPanelGroupWidth();
     expect(layoutClass()).toBe('layout-v-review-chat');
